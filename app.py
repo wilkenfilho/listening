@@ -37,12 +37,21 @@ RATE_PER_1000 = {"instagram": 1.90, "tiktok": 0.50}
 SENTIMENT_COLORS = {"Positivo": "#22C55E", "Neutro": "#94A3B8", "Negativo": "#EF4444"}
 ORIGENS_APIFY = ["Campanha BR (Apify)", "SIC - Reels", "SIC - TikTok"]
 FONTES = ["Apify (links de Instagram/TikTok)", "Pulsar (planilha exportada)"]
-TIPOS_ESTUDO = ["Marca própria", "Estudo de concorrência", "Marca própria + concorrência"]
+TIPOS_ESTUDO = [
+    "Marca própria",
+    "Estudo de concorrência",
+    "Marca própria + concorrência",
+    "Comportamental / cultural (sem marca específica)",
+]
 TIPOS_MARCA = ["Própria", "Concorrente"]
 
 
 def nova_marca() -> dict:
     return {"nome": "", "tipo": "Própria", "o_que_faz": "", "produtos": [""]}
+
+
+def novo_tema() -> dict:
+    return {"nome": "", "descricao": ""}
 
 PULSAR_SENTIMENT_MAP = {
     "positive": "Positivo",
@@ -108,6 +117,7 @@ DEFAULTS = {
     "estudo_objetivo": "",
     "tipo_estudo": TIPOS_ESTUDO[0],
     "marcas_estudo": [nova_marca()],
+    "temas_estudo": [novo_tema()],
     "diretrizes_extra": "",
     "reclassificar_pulsar_gemini": False,
     "gerar_relatorio_auto": True,
@@ -255,11 +265,23 @@ def montar_contexto_marcas() -> str:
         if produtos:
             bloco += f"\nProdutos: {', '.join(produtos)}"
         partes.append(bloco)
-    return "\n\n".join(partes) if partes else "Nenhuma marca detalhada."
+    return "\n\n".join(partes) if partes else ""
+
+
+def montar_contexto_temas() -> str:
+    partes = []
+    for t in st.session_state.temas_estudo:
+        if not t["nome"].strip():
+            continue
+        bloco = f"Tema/comportamento: {t['nome']}"
+        if t["descricao"].strip():
+            bloco += f"\nDescrição: {t['descricao'].strip()}"
+        partes.append(bloco)
+    return "\n\n".join(partes) if partes else ""
 
 
 def mapear_contexto_pulsar():
-    """Traduz o formulário de estudo/marcas/produtos do Pulsar para os campos
+    """Traduz o formulário de estudo/marcas/produtos/temas do Pulsar para os campos
     (campanha, marca, mother_brand, briefing, diretrizes_marca) já usados
     pelos prompts do Gemini e pelas exportações."""
     proprias = [m["nome"] for m in st.session_state.marcas_estudo if m["tipo"] == "Própria" and m["nome"].strip()]
@@ -270,10 +292,18 @@ def mapear_contexto_pulsar():
     st.session_state.mother_brand = ", ".join(concorrentes) if concorrentes else ""
     st.session_state.briefing = st.session_state.estudo_objetivo
 
-    diretrizes = f"Tipo de estudo: {st.session_state.tipo_estudo}\n\n{montar_contexto_marcas()}"
+    blocos = [f"Tipo de estudo: {st.session_state.tipo_estudo}"]
+    contexto_marcas = montar_contexto_marcas()
+    if contexto_marcas:
+        blocos.append(contexto_marcas)
+    contexto_temas = montar_contexto_temas()
+    if contexto_temas:
+        blocos.append("Temas/comportamentos/tendências em estudo:\n\n" + contexto_temas)
+    if not contexto_marcas and not contexto_temas:
+        blocos.append("Nenhuma marca ou tema específico detalhado — considere apenas o objetivo do estudo acima.")
     if st.session_state.diretrizes_extra.strip():
-        diretrizes += f"\n\nObservações adicionais: {st.session_state.diretrizes_extra.strip()}"
-    st.session_state.diretrizes_marca = diretrizes
+        blocos.append(f"Observações adicionais: {st.session_state.diretrizes_extra.strip()}")
+    st.session_state.diretrizes_marca = "\n\n".join(blocos)
 
 
 def montar_prompt_sentimento(comentario: str) -> str:
@@ -640,10 +670,11 @@ with tabs["🚀 Análise"]:
             index=TIPOS_ESTUDO.index(st.session_state.tipo_estudo),
         )
 
-        st.markdown("###### Marcas envolvidas")
+        st.markdown("###### Marcas envolvidas (opcional)")
         st.caption(
-            "Adicione a(s) marca(s) própria(s) e/ou concorrente(s), o que cada uma faz, e os "
-            "produtos específicos — se houver mais de um produto, adicione quantos precisar."
+            "Preencha se o estudo girar em torno de marca(s) — própria(s) e/ou concorrente(s), "
+            "o que cada uma faz, e os produtos específicos (adicione quantos precisar). Deixe o "
+            "nome em branco se o estudo não tiver marca no centro."
         )
         for i, m in enumerate(st.session_state.marcas_estudo):
             with st.container(border=True):
@@ -682,6 +713,34 @@ with tabs["🚀 Análise"]:
 
         if st.button("➕ Adicionar marca"):
             st.session_state.marcas_estudo.append(nova_marca())
+            st.rerun()
+
+        st.markdown("###### Temas, comportamentos ou tendências em estudo (opcional)")
+        st.caption(
+            "Pra estudos que não giram em torno de marca — um ato, ação, produto genérico, "
+            "comportamento, verbo, tendência, alimento, costume, cultura etc. Adicione quantos "
+            "temas precisar."
+        )
+        for i, t in enumerate(st.session_state.temas_estudo):
+            with st.container(border=True):
+                c1, c2 = st.columns([2, 0.4])
+                t["nome"] = c1.text_input(
+                    "Tema / comportamento / tendência", value=t["nome"], key=f"tema_nome_{i}",
+                    placeholder="Ex: veganismo, gírias da geração Z, romantizar a rotina...",
+                )
+                if c2.button("🗑️", key=f"tema_remover_{i}", help="Remover tema"):
+                    if len(st.session_state.temas_estudo) > 1:
+                        st.session_state.temas_estudo.pop(i)
+                        st.rerun()
+                    else:
+                        st.session_state.temas_estudo[0] = novo_tema()
+                        st.rerun()
+                t["descricao"] = st.text_area(
+                    "Descrição (contexto adicional sobre esse tema, opcional)",
+                    value=t["descricao"], height=60, key=f"tema_desc_{i}",
+                )
+        if st.button("➕ Adicionar tema"):
+            st.session_state.temas_estudo.append(novo_tema())
             st.rerun()
 
         st.session_state.diretrizes_extra = st.text_area(
