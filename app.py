@@ -569,14 +569,14 @@ with tabs["2️⃣ Coletar e analisar"]:
                                 run_input = {
                                     "directUrls": links,
                                     "resultsLimit": st.session_state.ig_limit,
-                                    "includeNestedComments": None,
+                                    "includeNestedComments": False,
                                 }
                                 actor_id = ACTOR_INSTAGRAM
                             else:
                                 run_input = {
                                     "postURLs": links,
                                     "commentsPerPost": st.session_state.tk_limit,
-                                    "topLevelCommentsPerPost": None,
+                                    "topLevelCommentsPerPost": st.session_state.tk_limit,
                                     "maxRepliesPerComment": 0,
                                     "profiles": None,
                                     "resultsPerPage": 100,
