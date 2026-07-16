@@ -578,7 +578,7 @@ with tabs["2️⃣ Coletar e analisar"]:
                                     "commentsPerPost": st.session_state.tk_limit,
                                     "topLevelCommentsPerPost": st.session_state.tk_limit,
                                     "maxRepliesPerComment": 0,
-                                    "profiles": None,
+                                    "profiles": [],
                                     "resultsPerPage": 100,
                                     "profileScrapeSections": ["videos"],
                                     "profileSorting": "latest",
@@ -589,7 +589,13 @@ with tabs["2️⃣ Coletar e analisar"]:
                                 actor_id = ACTOR_TIKTOK
 
                             run = client.actor(actor_id).call(run_input=run_input)
-                            items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+                            if isinstance(run, dict):
+                                dataset_id = run.get("defaultDatasetId")
+                            else:
+                                dataset_id = getattr(run, "default_dataset_id", None) or getattr(
+                                    run, "defaultDatasetId", None
+                                )
+                            items = list(client.dataset(dataset_id).iterate_items())
                             for item in items:
                                 rows.append(
                                     {
