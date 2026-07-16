@@ -104,7 +104,7 @@ DEFAULTS = {
     "relatorio_texto": "",
     "apify_token": "",
     "gemini_key": "",
-    "gemini_model": "gemini-2.0-flash",
+    "gemini_model": "gemini-flash-lite-latest",
     "bq_project": "",
     "bq_dataset": "",
     "bq_table_post_comments": "post_comments",
@@ -582,8 +582,6 @@ with tabs["2️⃣ Coletar e analisar"]:
                                     "resultsPerPage": 100,
                                     "profileScrapeSections": ["videos"],
                                     "profileSorting": "latest",
-                                    "oldestPostDateUnified": None,
-                                    "newestPostDate": None,
                                     "excludePinnedPosts": False,
                                 }
                                 actor_id = ACTOR_TIKTOK
@@ -673,7 +671,13 @@ with tabs["2️⃣ Coletar e analisar"]:
                             resultados["justificativa"] = justificativas
                             log(f"Gemini analisou {len(resultados)} comentários automaticamente.")
                         except Exception as e:
-                            st.error(f"Erro ao chamar Gemini: {e}")
+                            st.error(
+                                f"Erro ao chamar Gemini: {e} — aplicando classificação "
+                                "simulada como contingência para não travar o fluxo."
+                            )
+                            resultados["sentimento"] = resultados["comentario"].apply(classificar_demo)
+                            resultados["justificativa"] = "[FALLBACK] Gemini falhou nesta rodada — classificação simulada."
+                            log(f"Erro no Gemini, fallback aplicado: {e}")
                     else:
                         time.sleep(0.8)
                         resultados["sentimento"] = resultados["comentario"].apply(classificar_demo)
