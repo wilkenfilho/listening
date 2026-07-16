@@ -8,6 +8,7 @@ Configurações restrito ao admin (chaves de API, prompts do Gemini e acesso de 
 
 import io
 import json
+import math
 import os
 import random
 import time
@@ -37,6 +38,18 @@ RATE_PER_1000 = {"instagram": 1.90, "tiktok": 0.50}
 SENTIMENT_COLORS = {"Positivo": "#22C55E", "Neutro": "#94A3B8", "Negativo": "#EF4444"}
 ORIGENS_APIFY = ["Campanha BR (Apify)", "SIC - Reels", "SIC - TikTok"]
 FONTES = ["Apify (links de Instagram/TikTok)", "Pulsar (planilha exportada)"]
+
+# Processamento em chunks (evita 1 chamada de Gemini por comentário e evita
+# que o relatório aprofundado dependa de uma amostra pequena e não-fiel).
+TAMANHO_LOTE_CLASSIFICACAO = 25   # comentários classificados por chamada de Gemini
+TAMANHO_CHUNK_ANALISE = 150       # comentários lidos por chamada na análise aprofundada
+
+# Constantes (aproximadas) usadas só para estimar o ETA mostrado na tela.
+SEG_POR_LOTE_CLASSIFICACAO = 6
+SEG_POR_CHUNK_ANALISE = 10
+SEG_SINTESE_FINAL = 12
+SEG_POR_PLATAFORMA_APIFY = 25  # o tempo real do Actor varia bastante — é só uma referência
+
 TIPOS_ESTUDO = [
     "Marca própria",
     "Estudo de concorrência",
@@ -65,15 +78,62 @@ USERS_FILE = os.path.join(DATA_DIR, "usuarios_permitidos.json")
 PROMPTS_FILE = os.path.join(DATA_DIR, "prompts.json")
 
 DEFAULT_PROMPT_SENTIMENTO = """Você é um analista de social listening de uma agência de marketing.
-Classifique o sentimento do comentário abaixo em uma destas categorias: Positivo, Negativo ou Neutro.
+Classifique o sentimento de CADA comentário da lista abaixo em Positivo, Negativo ou Neutro.
+Seja fiel e literal ao que está escrito em cada comentário — não invente, não extrapole e não
+generalize além do que o texto realmente diz.
 
 Briefing do conteúdo: {{BRIEFING}}
 Diretrizes da marca para esta análise: {{DIRETRIZES}}
 
-Comentário: "{{COMENTARIO}}"
+Comentários (numerados):
+{{COMENTARIOS_NUMERADOS}}
 
-Responda SOMENTE em JSON, neste formato exato:
-{"sentimento": "Positivo", "justificativa": "explicação curta em português"}"""
+Responda SOMENTE em JSON, uma lista com um item por comentário, na mesma ordem numerada, neste
+formato exato:
+[{"indice": 1, "sentimento": "Positivo", "justificativa": "explicação curta em português"}, {"indice": 2, "sentimento": "Neutro", "justificativa": "..."}]"""
+
+DEFAULT_PROMPT_SENTIMENTO_APIFY = """Você é um analista de sentimento especializado em comentários de redes sociais.
+
+Contexto da campanha: {{CAMPANHA}}
+Marca: {{MARCA}}
+Briefing do conteúdo: {{BRIEFING}}
+Diretrizes da marca: {{DIRETRIZES}}
+
+Para CADA comentário da lista numerada abaixo, classifique com base estritamente no que está
+escrito — não invente nem extrapole:
+- sentimento: "Positivo", "Negativo" ou "Neutro"
+- alvo: sobre o que o comentário fala — "conteúdo" (o vídeo/post/criador em si), "marca",
+  "produto/serviço" ou "preço"
+- emocao: a emoção predominante (ex: alegria, raiva, surpresa, desprezo, indiferença, admiração...)
+- pertinencia: "pertinente" se o comentário tem relação com o post, a marca, o produto/serviço ou
+  o preço; "não_pertinente" se for genérico, spam, ou sem relação nenhuma com a campanha
+- justificativa: explicação curta em português
+
+Comentários (numerados):
+{{COMENTARIOS_NUMERADOS}}
+
+Responda SOMENTE em JSON, uma lista com um item por comentário, na mesma ordem numerada, neste
+formato exato:
+[{"indice": 1, "sentimento": "Positivo", "alvo": "marca", "emocao": "alegria", "pertinencia": "pertinente", "justificativa": "..."}]
+
+Regras importantes: a soma de itens classificados nunca deve ultrapassar o total de comentários
+enviados, e cada comentário recebe exatamente uma classificação de cada campo."""
+
+DEFAULT_PROMPT_ANALISE_BLOCO = """Você é um analista de social listening. Leia com atenção o bloco de
+comentários abaixo e responda de forma estritamente fiel ao que está escrito — não invente
+temas, exemplos ou conclusões que não estejam apoiados nos comentários deste bloco.
+
+Contexto do estudo: {{CONTEXTO}}
+
+Bloco de comentários ({{TOTAL_BLOCO}} comentários):
+{{COMENTARIOS_BLOCO}}
+
+Responda em português, em tópicos objetivos, cobrindo:
+- Principais temas e assuntos recorrentes neste bloco.
+- Padrões de sentimento observados (com 2-3 exemplos curtos e literais, sem inventar).
+- Sinais de oportunidade, se houver.
+- Sinais de risco ou crítica, se houver.
+Seja direto e conciso — isto é um resumo intermediário, não o relatório final."""
 
 DEFAULT_PROMPT_RELATORIO = """Você é um analista sênior de social listening e antropologia digital, \
 escrevendo um relatório para apresentar a clientes de uma agência de marketing.
@@ -86,7 +146,11 @@ Diretrizes da marca: {{DIRETRIZES}}
 Resumo quantitativo dos comentários analisados:
 {{RESUMO_QUANTITATIVO}}
 
-Amostra de comentários por sentimento:
+Resumos fiéis de cada bloco de comentários (esta é a base factual real da análise —
+use isto como fonte principal, não invente nada além do que está aqui):
+{{RESUMOS_DOS_BLOCOS}}
+
+Amostra de comentários literais, para ilustrar com citações reais:
 {{AMOSTRA_COMENTARIOS}}
 
 Escreva uma análise aprofundada, técnica e dissertativa (não apenas bullets soltos) cobrindo,
@@ -98,7 +162,9 @@ nesta ordem:
 5. Uma leitura antropológica/cultural do que os comentários revelam sobre esse público.
 6. Conclusão, amarrando os pontos acima em forma de storytelling.
 
-Escreva em português, tom técnico mas acessível, como material de estudo entregável ao cliente."""
+Mantenha-se estritamente fiel aos resumos dos blocos e aos comentários — não fuja do assunto
+nem introduza informação externa que não esteja apoiada no material fornecido. Escreva em
+português, tom técnico mas acessível, como material de estudo entregável ao cliente."""
 
 # ----------------------------------------------------------------------
 # ESTADO DA SESSÃO
@@ -140,8 +206,11 @@ DEFAULTS = {
     "pode_configurar": False,
     "usuarios_permitidos": None,
     "prompt_sentimento": DEFAULT_PROMPT_SENTIMENTO,
+    "prompt_sentimento_apify": DEFAULT_PROMPT_SENTIMENTO_APIFY,
+    "prompt_analise_bloco": DEFAULT_PROMPT_ANALISE_BLOCO,
     "prompt_relatorio": DEFAULT_PROMPT_RELATORIO,
     "prompts_loaded": False,
+    "job": None,
 }
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
@@ -306,16 +375,6 @@ def mapear_contexto_pulsar():
     st.session_state.diretrizes_marca = "\n\n".join(blocos)
 
 
-def montar_prompt_sentimento(comentario: str) -> str:
-    return (
-        st.session_state.prompt_sentimento.replace(
-            "{{BRIEFING}}", st.session_state.briefing or "Não informado."
-        )
-        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica.")
-        .replace("{{COMENTARIO}}", str(comentario))
-    )
-
-
 def classificar_demo(texto: str) -> str:
     negativos = ["não gostei", "péssima", "quebrado", "ruim"]
     positivos = ["adorei", "incrível", "excelente", "recomendo"]
@@ -327,46 +386,149 @@ def classificar_demo(texto: str) -> str:
     return "Neutro"
 
 
-def classificar_comentarios_gemini(df: pd.DataFrame) -> pd.DataFrame:
-    """Roda a sentimentalização (Gemini, ou fallback demo) sobre a coluna 'comentario'."""
-    resultados = df.copy()
-    if is_gemini_configured():
-        try:
-            import google.generativeai as genai
+def formatar_duracao(segundos: float) -> str:
+    segundos = max(0, int(round(segundos)))
+    m, s = divmod(segundos, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}min"
+    if m:
+        return f"{m}min {s}s"
+    return f"{s}s"
 
-            genai.configure(api_key=st.session_state.gemini_key)
-            model = genai.GenerativeModel(st.session_state.gemini_model)
-            sentimentos, justificativas = [], []
-            progress = st.progress(0)
-            total = len(resultados)
-            for i, comentario in enumerate(resultados["comentario"]):
-                prompt = montar_prompt_sentimento(comentario)
-                resp = model.generate_content(prompt)
-                try:
-                    parsed = json.loads(resp.text.strip().strip("```json").strip("```"))
-                    sentimentos.append(parsed.get("sentimento", "Neutro"))
-                    justificativas.append(parsed.get("justificativa", ""))
-                except Exception:
-                    sentimentos.append("Neutro")
-                    justificativas.append(resp.text[:120])
-                if total:
-                    progress.progress((i + 1) / total)
-            resultados["sentimento"] = sentimentos
-            resultados["justificativa"] = justificativas
-            log(f"Gemini analisou {len(resultados)} comentários automaticamente.")
-        except Exception as e:
-            st.error(
-                f"Erro ao chamar Gemini: {e} — aplicando classificação simulada como contingência."
-            )
-            resultados["sentimento"] = resultados["comentario"].apply(classificar_demo)
-            resultados["justificativa"] = "[FALLBACK] Gemini falhou nesta rodada — classificação simulada."
-            log(f"Erro no Gemini, fallback aplicado: {e}")
-    else:
-        time.sleep(0.5)
-        resultados["sentimento"] = resultados["comentario"].apply(classificar_demo)
-        resultados["justificativa"] = "[DEMO] classificação simulada por palavras-chave"
-        log(f"[DEMO] {len(resultados)} comentários classificados (simulado).")
-    return resultados
+
+def dividir_em_lotes(lista, tamanho):
+    lista = list(lista)
+    return [lista[i:i + tamanho] for i in range(0, len(lista), tamanho)]
+
+
+def classificar_lote_gemini(model, lote_linhas: list) -> list:
+    """Classifica um lote de comentários numa única chamada de Gemini."""
+    numerados = "\n".join(f"{i+1}. {r.get('comentario','')}" for i, r in enumerate(lote_linhas))
+    prompt = (
+        st.session_state.prompt_sentimento
+        .replace("{{BRIEFING}}", st.session_state.briefing or "Não informado.")
+        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica.")
+        .replace("{{COMENTARIOS_NUMERADOS}}", numerados)
+    )
+    resp = model.generate_content(prompt)
+    mapa = {}
+    try:
+        parsed = json.loads(resp.text.strip().strip("```json").strip("```"))
+        mapa = {int(item.get("indice", 0)): item for item in parsed if isinstance(item, dict)}
+    except Exception:
+        mapa = {}
+    resultado = []
+    for i, r in enumerate(lote_linhas):
+        item = mapa.get(i + 1, {})
+        nova = dict(r)
+        nova["sentimento"] = item.get("sentimento", "Neutro")
+        nova["justificativa"] = item.get("justificativa", "[sem retorno estruturado do Gemini para este item]")
+        resultado.append(nova)
+    return resultado
+
+
+def classificar_lote_gemini_apify(model, lote_linhas: list) -> list:
+    """Classificação específica do Apify: sentimento + alvo + emoção + pertinência."""
+    numerados = "\n".join(f"{i+1}. {r.get('comentario','')}" for i, r in enumerate(lote_linhas))
+    prompt = (
+        st.session_state.prompt_sentimento_apify
+        .replace("{{CAMPANHA}}", st.session_state.campanha or "Não informado.")
+        .replace("{{MARCA}}", st.session_state.marca or "Não informado.")
+        .replace("{{BRIEFING}}", st.session_state.briefing or "Não informado.")
+        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica.")
+        .replace("{{COMENTARIOS_NUMERADOS}}", numerados)
+    )
+    resp = model.generate_content(prompt)
+    mapa = {}
+    try:
+        parsed = json.loads(resp.text.strip().strip("```json").strip("```"))
+        mapa = {int(item.get("indice", 0)): item for item in parsed if isinstance(item, dict)}
+    except Exception:
+        mapa = {}
+    resultado = []
+    for i, r in enumerate(lote_linhas):
+        item = mapa.get(i + 1, {})
+        nova = dict(r)
+        nova["sentimento"] = item.get("sentimento", "Neutro")
+        nova["alvo"] = item.get("alvo", "conteúdo")
+        nova["emocao"] = item.get("emocao", "indiferença")
+        nova["pertinencia"] = item.get("pertinencia", "pertinente")
+        nova["justificativa"] = item.get("justificativa", "[sem retorno estruturado do Gemini para este item]")
+        resultado.append(nova)
+    return resultado
+
+
+ALVOS_DEMO = ["conteúdo", "marca", "produto/serviço", "preço"]
+
+
+def classificar_lote_demo(lote_linhas: list, apify: bool = False) -> list:
+    resultado = []
+    for r in lote_linhas:
+        nova = dict(r)
+        sentimento = classificar_demo(nova.get("comentario", ""))
+        nova["sentimento"] = sentimento
+        nova["justificativa"] = "[DEMO] classificação simulada por palavras-chave"
+        if apify:
+            nova["alvo"] = random.choice(ALVOS_DEMO)
+            nova["emocao"] = {"Positivo": "satisfação", "Negativo": "insatisfação", "Neutro": "indiferença"}[sentimento]
+            nova["pertinencia"] = "pertinente"
+        resultado.append(nova)
+    return resultado
+
+
+def analisar_bloco_gemini(model, bloco_comentarios: list, contexto_texto: str) -> str:
+    texto = "\n".join(f'- "{c}"' for c in bloco_comentarios)
+    prompt = (
+        st.session_state.prompt_analise_bloco
+        .replace("{{CONTEXTO}}", contexto_texto)
+        .replace("{{TOTAL_BLOCO}}", str(len(bloco_comentarios)))
+        .replace("{{COMENTARIOS_BLOCO}}", texto)
+    )
+    resp = model.generate_content(prompt)
+    return resp.text
+
+
+def montar_contexto_estudo_texto() -> str:
+    return (
+        f"Campanha/estudo: {st.session_state.campanha or 'Não informado'}\n"
+        f"Marca: {st.session_state.marca or 'Não informado'} | "
+        f"Mother brand: {st.session_state.mother_brand or 'Não informado'} | "
+        f"Núcleo: {st.session_state.nucleo or 'Não informado'}\n"
+        f"Objetivo/briefing: {st.session_state.briefing or 'Não informado'}\n"
+        f"Diretrizes: {st.session_state.diretrizes_marca or 'Nenhuma diretriz específica'}"
+    )
+
+
+def gerar_sintese_final(model, resultados_df: pd.DataFrame, resumos_blocos: list) -> str:
+    contagem = resultados_df["sentimento"].value_counts()
+    total = len(resultados_df)
+    resumo_quant = "\n".join(
+        f"- {s}: {int(contagem.get(s,0))} comentários ({contagem.get(s,0)/total:.0%})"
+        for s in ["Positivo", "Neutro", "Negativo"]
+    )
+    amostra_partes = []
+    for s in ["Positivo", "Neutro", "Negativo"]:
+        exemplos = resultados_df[resultados_df["sentimento"] == s]["comentario"].head(5).tolist()
+        if exemplos:
+            amostra_partes.append(f"{s}:\n" + "\n".join(f'- "{c}"' for c in exemplos))
+    amostra = "\n\n".join(amostra_partes)
+    resumos_texto = "\n\n---\n\n".join(f"[Bloco {i+1}]\n{r}" for i, r in enumerate(resumos_blocos)) or "Nenhum bloco processado."
+
+    prompt = (
+        st.session_state.prompt_relatorio
+        .replace("{{CAMPANHA}}", st.session_state.campanha or "Não informado")
+        .replace("{{MARCA}}", st.session_state.marca or "Não informado")
+        .replace("{{MOTHER_BRAND}}", st.session_state.mother_brand or "Não informado")
+        .replace("{{NUCLEO}}", st.session_state.nucleo or "Não informado")
+        .replace("{{BRIEFING}}", st.session_state.briefing or "Não informado")
+        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica")
+        .replace("{{RESUMO_QUANTITATIVO}}", resumo_quant)
+        .replace("{{RESUMOS_DOS_BLOCOS}}", resumos_texto)
+        .replace("{{AMOSTRA_COMENTARIOS}}", amostra)
+    )
+    resp = model.generate_content(prompt)
+    return resp.text
 
 
 def ler_planilha_pulsar(arquivo) -> pd.DataFrame:
@@ -387,54 +549,284 @@ def ler_planilha_pulsar(arquivo) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def gerar_relatorio(resultados: pd.DataFrame) -> str:
-    contagem = resultados["sentimento"].value_counts()
-    total = len(resultados)
-    resumo = "\n".join(
-        f"- {s}: {int(contagem.get(s,0))} comentários ({contagem.get(s,0)/total:.0%})"
-        for s in ["Positivo", "Neutro", "Negativo"]
+# ----------------------------------------------------------------------
+# MOTOR DE PROCESSAMENTO EM FILA (ETA + barra de progresso + cancelar)
+# ----------------------------------------------------------------------
+def estimar_segundos(n_comentarios: int, n_plataformas_apify: int, precisa_classificar: bool, gerar_relatorio: bool) -> int:
+    seg = n_plataformas_apify * SEG_POR_PLATAFORMA_APIFY
+    if precisa_classificar and n_comentarios:
+        seg += math.ceil(n_comentarios / TAMANHO_LOTE_CLASSIFICACAO) * SEG_POR_LOTE_CLASSIFICACAO
+    if gerar_relatorio and n_comentarios:
+        seg += math.ceil(n_comentarios / TAMANHO_CHUNK_ANALISE) * SEG_POR_CHUNK_ANALISE + SEG_SINTESE_FINAL
+    return seg
+
+
+def recomputar_total_passos(job: dict):
+    n = len(job["linhas_coletadas"]) or len(job["linhas_prontas"])
+    passos = job["passos_apify_fixos"]
+    if job["precisa_classificar"] and n:
+        passos += math.ceil(n / TAMANHO_LOTE_CLASSIFICACAO)
+    if job["gerar_relatorio"] and n:
+        passos += math.ceil(n / TAMANHO_CHUNK_ANALISE) + 1
+    job["total_passos"] = max(passos, job["passos_concluidos"] + 1)
+
+
+def criar_job_apify(links_por_plataforma: dict, gerar_relatorio: bool) -> dict:
+    plataformas_pendentes = [p for p in ("instagram", "tiktok") if links_por_plataforma.get(p)]
+    n_estimado = (
+        len(links_por_plataforma.get("instagram", [])) * st.session_state.ig_limit
+        + len(links_por_plataforma.get("tiktok", [])) * st.session_state.tk_limit
     )
-    amostra_partes = []
-    for s in ["Positivo", "Neutro", "Negativo"]:
-        exemplos = resultados[resultados["sentimento"] == s]["comentario"].head(8).tolist()
-        if exemplos:
-            amostra_partes.append(f"{s}:\n" + "\n".join(f'- "{c}"' for c in exemplos))
-    amostra = "\n\n".join(amostra_partes)
+    job = {
+        "fonte": "apify",
+        "fase": "coleta_apify" if plataformas_pendentes else "preparar_classificacao",
+        "inicio": time.time(),
+        "links_por_plataforma": links_por_plataforma,
+        "plataformas_pendentes": plataformas_pendentes,
+        "passos_apify_fixos": len(plataformas_pendentes),
+        "linhas_coletadas": [],
+        "linhas_prontas": [],
+        "custo_total": 0.0,
+        "precisa_classificar": True,
+        "gerar_relatorio": gerar_relatorio,
+        "fila_lotes_classificacao": [],
+        "fila_chunks_analise": [],
+        "resumos_blocos": [],
+        "relatorio_final": "",
+        "contexto_estudo_texto": montar_contexto_estudo_texto(),
+        "tempos_passo": [],
+        "passos_concluidos": 0,
+        "total_passos": max(1, len(plataformas_pendentes)),
+        "erro_msg": None,
+    }
+    job["total_passos"] = max(
+        job["total_passos"],
+        len(plataformas_pendentes)
+        + (math.ceil(n_estimado / TAMANHO_LOTE_CLASSIFICACAO) if n_estimado else 0)
+        + (math.ceil(n_estimado / TAMANHO_CHUNK_ANALISE) + 1 if gerar_relatorio and n_estimado else 0),
+    )
+    return job
 
-    if is_gemini_configured():
+
+def criar_job_pulsar(arquivo_pulsar, reclassificar: bool, gerar_relatorio: bool) -> dict:
+    job = {
+        "fonte": "pulsar",
+        "fase": "ler_pulsar",
+        "inicio": time.time(),
+        "pulsar_bytes": arquivo_pulsar.getvalue(),
+        "linhas_coletadas": [],
+        "linhas_prontas": [],
+        "custo_total": 0.0,
+        "precisa_classificar": reclassificar,
+        "gerar_relatorio": gerar_relatorio,
+        "fila_lotes_classificacao": [],
+        "fila_chunks_analise": [],
+        "resumos_blocos": [],
+        "relatorio_final": "",
+        "contexto_estudo_texto": montar_contexto_estudo_texto(),
+        "tempos_passo": [],
+        "passos_concluidos": 0,
+        "total_passos": 1,
+        "passos_apify_fixos": 0,
+        "erro_msg": None,
+    }
+    return job
+
+
+def processar_passo_job(job: dict):
+    """Executa exatamente UM passo (uma chamada de API) e avança a fase do job."""
+    fase = job["fase"]
+
+    if fase == "coleta_apify":
+        plataforma = job["plataformas_pendentes"].pop(0)
+        plinks = job["links_por_plataforma"][plataforma]
+        rows = []
+        if is_apify_configured():
+            try:
+                from apify_client import ApifyClient
+
+                client = ApifyClient(st.session_state.apify_token)
+                if plataforma == "instagram":
+                    run_input = {
+                        "directUrls": plinks,
+                        "resultsLimit": st.session_state.ig_limit,
+                        "includeNestedComments": False,
+                    }
+                    actor_id = ACTOR_INSTAGRAM
+                else:
+                    run_input = {
+                        "postURLs": plinks,
+                        "commentsPerPost": st.session_state.tk_limit,
+                        "topLevelCommentsPerPost": st.session_state.tk_limit,
+                        "maxRepliesPerComment": 0,
+                        "profiles": [],
+                        "resultsPerPage": 100,
+                        "profileScrapeSections": ["videos"],
+                        "profileSorting": "latest",
+                        "excludePinnedPosts": False,
+                    }
+                    actor_id = ACTOR_TIKTOK
+
+                run = client.actor(actor_id).call(run_input=run_input)
+                if isinstance(run, dict):
+                    dataset_id = run.get("defaultDatasetId")
+                else:
+                    dataset_id = getattr(run, "default_dataset_id", None) or getattr(run, "defaultDatasetId", None)
+                items = list(client.dataset(dataset_id).iterate_items())
+                for item in items:
+                    rows.append(
+                        {
+                            "post_link": item.get("postUrl") or item.get("videoUrl") or item.get("url", ""),
+                            "plataforma": plataforma,
+                            "autor": item.get("ownerUsername") or item.get("uniqueId") or item.get("author", ""),
+                            "comentario": item.get("text") or item.get("comment", ""),
+                            "data_extracao": datetime.now().isoformat(),
+                        }
+                    )
+                log(f"Apify ({plataforma}) retornou {len(rows)} comentários reais.")
+            except Exception as e:
+                job["erro_msg"] = f"Erro ao chamar Apify ({plataforma}): {e}"
+                log(job["erro_msg"])
+        else:
+            time.sleep(0.3)
+            exemplos = [
+                "Adorei esse conteúdo, muito útil!",
+                "Não gostei do produto, veio quebrado.",
+                "Achei ok, nada de mais.",
+                "Excelente atendimento, super recomendo!",
+                "Poderia ser melhor explicado.",
+                "Péssima experiência, não volto mais.",
+                "Simplesmente incrível, superou minhas expectativas!",
+                "Comentário neutro sobre o assunto.",
+            ]
+            for link in plinks:
+                for _ in range(random.randint(3, 6)):
+                    rows.append(
+                        {
+                            "post_link": link,
+                            "plataforma": plataforma,
+                            "autor": f"usuario_{random.randint(100,999)}",
+                            "comentario": random.choice(exemplos),
+                            "data_extracao": datetime.now().isoformat(),
+                        }
+                    )
+            log(f"[DEMO] {len(rows)} comentários fictícios gerados ({plataforma}).")
+
+        if rows:
+            job["linhas_coletadas"].extend(rows)
+            job["custo_total"] += registrar_gasto(plataforma, len(rows))
+
+        job["fase"] = "preparar_classificacao" if not job["plataformas_pendentes"] else "coleta_apify"
+        return
+
+    if fase == "ler_pulsar":
         try:
-            import google.generativeai as genai
-
-            genai.configure(api_key=st.session_state.gemini_key)
-            model = genai.GenerativeModel(st.session_state.gemini_model)
-            prompt = (
-                st.session_state.prompt_relatorio.replace("{{CAMPANHA}}", st.session_state.campanha or "Não informado")
-                .replace("{{MARCA}}", st.session_state.marca or "Não informado")
-                .replace("{{MOTHER_BRAND}}", st.session_state.mother_brand or "Não informado")
-                .replace("{{NUCLEO}}", st.session_state.nucleo or "Não informado")
-                .replace("{{BRIEFING}}", st.session_state.briefing or "Não informado")
-                .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica")
-                .replace("{{RESUMO_QUANTITATIVO}}", resumo)
-                .replace("{{AMOSTRA_COMENTARIOS}}", amostra)
-            )
-            resp = model.generate_content(prompt)
-            log("Relatório aprofundado gerado pelo Gemini.")
-            return resp.text
+            df = ler_planilha_pulsar(io.BytesIO(job["pulsar_bytes"]))
+            log(f"Planilha do Pulsar lida: {len(df)} comentários.")
+            if job["precisa_classificar"]:
+                job["linhas_coletadas"] = df.drop(columns=["sentimento", "justificativa"]).to_dict("records")
+            else:
+                job["linhas_prontas"] = df.to_dict("records")
+                log("Usando a classificação de sentimento original do Pulsar.")
         except Exception as e:
-            st.error(f"Erro ao gerar relatório com Gemini: {e}")
-            log(f"Erro ao gerar relatório: {e}")
-            return ""
-    else:
-        log("[DEMO] Relatório-modelo gerado (Gemini não configurado).")
-        return (
-            f"# [DEMO] Análise aprofundada — {st.session_state.campanha or 'campanha sem nome'}\n\n"
-            f"**Marca:** {st.session_state.marca or '-'} · "
-            f"**Mother brand:** {st.session_state.mother_brand or '-'} · "
-            f"**Núcleo:** {st.session_state.nucleo or '-'}\n\n"
-            f"## Panorama geral\n\n{resumo}\n\n"
-            "## Observação\n\nEste é um relatório simulado (modo demonstração) — "
-            "configure a Gemini API Key para gerar a análise dissertativa completa."
-        )
+            job["erro_msg"] = f"Erro ao ler a planilha do Pulsar: {e}"
+            log(job["erro_msg"])
+        job["fase"] = "preparar_classificacao"
+        return
+
+    if fase == "preparar_classificacao":
+        recomputar_total_passos(job)
+        if job["precisa_classificar"] and job["linhas_coletadas"]:
+            job["fila_lotes_classificacao"] = dividir_em_lotes(job["linhas_coletadas"], TAMANHO_LOTE_CLASSIFICACAO)
+            job["fase"] = "classificacao"
+        else:
+            job["fase"] = "preparar_analise"
+        return
+
+    if fase == "classificacao":
+        lote = job["fila_lotes_classificacao"].pop(0)
+        eh_apify = job["fonte"] == "apify"
+        if is_gemini_configured():
+            try:
+                import google.generativeai as genai
+
+                genai.configure(api_key=st.session_state.gemini_key)
+                model = genai.GenerativeModel(st.session_state.gemini_model)
+                if eh_apify:
+                    classificados = classificar_lote_gemini_apify(model, lote)
+                else:
+                    classificados = classificar_lote_gemini(model, lote)
+            except Exception as e:
+                job["erro_msg"] = f"Erro no Gemini ao classificar — aplicando fallback simulado ({e})."
+                log(job["erro_msg"])
+                classificados = classificar_lote_demo(lote, apify=eh_apify)
+        else:
+            classificados = classificar_lote_demo(lote, apify=eh_apify)
+        job["linhas_prontas"].extend(classificados)
+        if not job["fila_lotes_classificacao"]:
+            log(f"Classificação concluída: {len(job['linhas_prontas'])} comentários.")
+            job["fase"] = "preparar_analise"
+        return
+
+    if fase == "preparar_analise":
+        recomputar_total_passos(job)
+        if job["gerar_relatorio"] and job["linhas_prontas"]:
+            comentarios = [r.get("comentario", "") for r in job["linhas_prontas"]]
+            job["fila_chunks_analise"] = dividir_em_lotes(comentarios, TAMANHO_CHUNK_ANALISE)
+            job["fase"] = "analise_blocos"
+        else:
+            job["fase"] = "concluido"
+        return
+
+    if fase == "analise_blocos":
+        bloco = job["fila_chunks_analise"].pop(0)
+        if is_gemini_configured():
+            try:
+                import google.generativeai as genai
+
+                genai.configure(api_key=st.session_state.gemini_key)
+                model = genai.GenerativeModel(st.session_state.gemini_model)
+                resumo = analisar_bloco_gemini(model, bloco, job["contexto_estudo_texto"])
+            except Exception as e:
+                resumo = f"[Bloco não pôde ser analisado pelo Gemini: {e}]"
+                log(f"Erro ao analisar bloco: {e}")
+        else:
+            contagem_local = pd.Series(bloco).apply(classificar_demo).value_counts()
+            resumo = "[DEMO] " + ", ".join(f"{k}: {v}" for k, v in contagem_local.items())
+        job["resumos_blocos"].append(resumo)
+        if not job["fila_chunks_analise"]:
+            job["fase"] = "sintese"
+        return
+
+    if fase == "sintese":
+        df_prontas = pd.DataFrame(job["linhas_prontas"])
+        if is_gemini_configured():
+            try:
+                import google.generativeai as genai
+
+                genai.configure(api_key=st.session_state.gemini_key)
+                model = genai.GenerativeModel(st.session_state.gemini_model)
+                job["relatorio_final"] = gerar_sintese_final(model, df_prontas, job["resumos_blocos"])
+                log("Relatório aprofundado gerado a partir dos blocos (Gemini).")
+            except Exception as e:
+                job["relatorio_final"] = f"Não foi possível gerar o relatório final: {e}"
+                log(f"Erro na síntese final: {e}")
+        else:
+            contagem = df_prontas["sentimento"].value_counts()
+            total = len(df_prontas)
+            resumo = "\n".join(
+                f"- {s}: {int(contagem.get(s,0))} ({contagem.get(s,0)/total:.0%})"
+                for s in ["Positivo", "Neutro", "Negativo"]
+            )
+            job["relatorio_final"] = (
+                f"# [DEMO] Análise aprofundada — {st.session_state.campanha or 'estudo sem nome'}\n\n"
+                f"## Panorama geral\n\n{resumo}\n\n"
+                "## Observação\n\nRelatório simulado — configure a Gemini API Key para gerar a "
+                "análise dissertativa completa a partir dos blocos processados."
+            )
+            log("[DEMO] Relatório-modelo gerado (Gemini não configurado).")
+        job["fase"] = "concluido"
+        return
 
 
 # ----------------------------------------------------------------------
@@ -501,6 +893,10 @@ def carregar_prompts():
             with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
                 dados = json.load(f)
             st.session_state.prompt_sentimento = dados.get("prompt_sentimento", DEFAULT_PROMPT_SENTIMENTO)
+            st.session_state.prompt_sentimento_apify = dados.get(
+                "prompt_sentimento_apify", DEFAULT_PROMPT_SENTIMENTO_APIFY
+            )
+            st.session_state.prompt_analise_bloco = dados.get("prompt_analise_bloco", DEFAULT_PROMPT_ANALISE_BLOCO)
             st.session_state.prompt_relatorio = dados.get("prompt_relatorio", DEFAULT_PROMPT_RELATORIO)
         except Exception:
             pass
@@ -513,6 +909,8 @@ def salvar_prompts():
             json.dump(
                 {
                     "prompt_sentimento": st.session_state.prompt_sentimento,
+                    "prompt_sentimento_apify": st.session_state.prompt_sentimento_apify,
+                    "prompt_analise_bloco": st.session_state.prompt_analise_bloco,
                     "prompt_relatorio": st.session_state.prompt_relatorio,
                 },
                 f,
@@ -613,7 +1011,12 @@ tabs = dict(zip(tab_labels, tab_objects))
 # 🚀 ANÁLISE — tela única
 # ----------------------------------------------------------------------
 with tabs["🚀 Análise"]:
-    st.session_state.fonte = st.radio("Fonte dos dados", FONTES, horizontal=True)
+    _job_em_andamento = st.session_state.job is not None and st.session_state.job["fase"] not in ("concluido", "cancelado")
+
+    if _job_em_andamento:
+        st.info("⏳ Um processamento já está em andamento — os campos abaixo ficam bloqueados até terminar ou você cancelar.")
+
+    st.session_state.fonte = st.radio("Fonte dos dados", FONTES, horizontal=True, disabled=_job_em_andamento)
 
     arquivo_pulsar = None
     if st.session_state.fonte == FONTES[0]:
@@ -749,7 +1152,8 @@ with tabs["🚀 Análise"]:
         )
 
     st.session_state.gerar_relatorio_auto = st.checkbox(
-        "Gerar também a análise aprofundada (relatório dissertativo)",
+        "Gerar também a análise aprofundada (relatório dissertativo, lido em blocos e depois "
+        "sintetizado — mais fiel aos comentários do que um resumo com amostra pequena)",
         value=st.session_state.gerar_relatorio_auto,
     )
 
@@ -758,153 +1162,126 @@ with tabs["🚀 Análise"]:
     if not is_gemini_configured():
         st.warning("Gemini não configurado — sentimento/relatório serão simulados (modo demonstração).")
 
-    rodar = st.button("🚀 Rodar análise completa", type="primary", use_container_width=True)
+    job_ativo = st.session_state.job is not None and st.session_state.job["fase"] not in ("concluido", "cancelado")
 
-    if rodar:
-        resultados = None
-
-        # ---------------- FONTE: PULSAR ----------------
-        if st.session_state.fonte == FONTES[1]:
-            mapear_contexto_pulsar()
-            if arquivo_pulsar is None:
-                st.warning("Envie a planilha do Pulsar antes de rodar.")
-            else:
-                with st.spinner("Lendo a planilha do Pulsar..."):
-                    try:
-                        base = ler_planilha_pulsar(arquivo_pulsar)
-                        log(f"Planilha do Pulsar lida: {len(base)} comentários.")
-                    except Exception as e:
-                        st.error(f"Erro ao ler a planilha do Pulsar: {e}")
-                        base = None
-
-                if base is not None and not base.empty:
-                    if st.session_state.reclassificar_pulsar_gemini:
-                        with st.spinner("Reclassificando com Gemini..."):
-                            resultados = classificar_comentarios_gemini(base.drop(columns=["sentimento", "justificativa"]))
-                    else:
-                        resultados = base
-                        log("Usando a classificação de sentimento original do Pulsar.")
-
-        # ---------------- FONTE: APIFY ----------------
+    # ---------------- ETA prévio (antes de clicar em rodar) ----------------
+    if not job_ativo:
+        if st.session_state.fonte == FONTES[0]:
+            links_previa = [l.strip() for l in st.session_state.links_input.splitlines() if l.strip()]
+            n_ig = sum(1 for l in links_previa if detectar_plataforma(l) == "instagram")
+            n_tk = sum(1 for l in links_previa if detectar_plataforma(l) == "tiktok")
+            n_estimado = n_ig * st.session_state.ig_limit + n_tk * st.session_state.tk_limit
+            n_plataformas = (1 if n_ig else 0) + (1 if n_tk else 0)
         else:
-            links = [l.strip() for l in st.session_state.links_input.splitlines() if l.strip()]
-            if not links:
-                st.warning("Cole ao menos um link antes de rodar.")
-            else:
-                links_por_plataforma = {"instagram": [], "tiktok": [], "desconhecido": []}
-                for l in links:
-                    links_por_plataforma[detectar_plataforma(l)].append(l)
+            n_estimado = 2000 if arquivo_pulsar is not None else 0  # placeholder até ler o arquivo de verdade
+            n_plataformas = 0
 
-                todos_rows = []
-                custo_total_execucao = 0.0
-                for plataforma in ("instagram", "tiktok"):
-                    plinks = links_por_plataforma[plataforma]
-                    if not plinks:
-                        continue
-                    with st.spinner(f"Coletando comentários — {plataforma}..."):
-                        rows = []
-                        if is_apify_configured():
-                            try:
-                                from apify_client import ApifyClient
+        if n_estimado or n_plataformas:
+            precisa_classificar = (
+                True if st.session_state.fonte == FONTES[0] else st.session_state.reclassificar_pulsar_gemini
+            )
+            eta = estimar_segundos(n_estimado, n_plataformas, precisa_classificar, st.session_state.gerar_relatorio_auto)
+            st.caption(
+                f"⏱️ Tempo estimado: ~{formatar_duracao(eta)} "
+                f"(estimativa aproximada, atualizada durante a execução)."
+            )
 
-                                client = ApifyClient(st.session_state.apify_token)
-                                if plataforma == "instagram":
-                                    run_input = {
-                                        "directUrls": plinks,
-                                        "resultsLimit": st.session_state.ig_limit,
-                                        "includeNestedComments": False,
-                                    }
-                                    actor_id = ACTOR_INSTAGRAM
-                                else:
-                                    run_input = {
-                                        "postURLs": plinks,
-                                        "commentsPerPost": st.session_state.tk_limit,
-                                        "topLevelCommentsPerPost": st.session_state.tk_limit,
-                                        "maxRepliesPerComment": 0,
-                                        "profiles": [],
-                                        "resultsPerPage": 100,
-                                        "profileScrapeSections": ["videos"],
-                                        "profileSorting": "latest",
-                                        "excludePinnedPosts": False,
-                                    }
-                                    actor_id = ACTOR_TIKTOK
+        rodar = st.button("🚀 Rodar análise completa", type="primary", use_container_width=True)
 
-                                run = client.actor(actor_id).call(run_input=run_input)
-                                if isinstance(run, dict):
-                                    dataset_id = run.get("defaultDatasetId")
-                                else:
-                                    dataset_id = getattr(run, "default_dataset_id", None) or getattr(
-                                        run, "defaultDatasetId", None
-                                    )
-                                items = list(client.dataset(dataset_id).iterate_items())
-                                for item in items:
-                                    rows.append(
-                                        {
-                                            "post_link": item.get("postUrl") or item.get("videoUrl") or item.get("url", ""),
-                                            "plataforma": plataforma,
-                                            "autor": item.get("ownerUsername") or item.get("uniqueId") or item.get("author", ""),
-                                            "comentario": item.get("text") or item.get("comment", ""),
-                                            "data_extracao": datetime.now().isoformat(),
-                                        }
-                                    )
-                                log(f"Apify ({plataforma}) retornou {len(rows)} comentários reais.")
-                            except Exception as e:
-                                st.error(f"Erro ao chamar Apify ({plataforma}): {e}")
-                        else:
-                            time.sleep(0.5)
-                            exemplos = [
-                                "Adorei esse conteúdo, muito útil!",
-                                "Não gostei do produto, veio quebrado.",
-                                "Achei ok, nada de mais.",
-                                "Excelente atendimento, super recomendo!",
-                                "Poderia ser melhor explicado.",
-                                "Péssima experiência, não volto mais.",
-                                "Simplesmente incrível, superou minhas expectativas!",
-                                "Comentário neutro sobre o assunto.",
-                            ]
-                            for link in plinks:
-                                for _ in range(random.randint(3, 6)):
-                                    rows.append(
-                                        {
-                                            "post_link": link,
-                                            "plataforma": plataforma,
-                                            "autor": f"usuario_{random.randint(100,999)}",
-                                            "comentario": random.choice(exemplos),
-                                            "data_extracao": datetime.now().isoformat(),
-                                        }
-                                    )
-                            log(f"[DEMO] {len(rows)} comentários fictícios gerados ({plataforma}).")
-
-                        if rows:
-                            todos_rows.extend(rows)
-                            custo = registrar_gasto(plataforma, len(rows))
-                            custo_total_execucao += custo
-
-                if todos_rows:
-                    df = pd.DataFrame(todos_rows)
-                    log(f"Coleta finalizada: {len(df)} comentários. Custo: ${custo_total_execucao:.2f}.")
-                    with st.spinner("Rodando sentimentalização automática no Gemini..."):
-                        resultados = classificar_comentarios_gemini(df)
-                    st.info(f"Custo desta coleta: **${custo_total_execucao:.2f}** (registrado em 💰 Gastos).")
+        if rodar:
+            if st.session_state.fonte == FONTES[1]:
+                mapear_contexto_pulsar()
+                if arquivo_pulsar is None:
+                    st.warning("Envie a planilha do Pulsar antes de rodar.")
                 else:
-                    st.warning("Nenhum comentário coletado.")
+                    st.session_state.job = criar_job_pulsar(
+                        arquivo_pulsar, st.session_state.reclassificar_pulsar_gemini, st.session_state.gerar_relatorio_auto
+                    )
+                    st.session_state.resultados_df = None
+                    st.session_state.relatorio_texto = ""
+                    st.rerun()
+            else:
+                links = [l.strip() for l in st.session_state.links_input.splitlines() if l.strip()]
+                if not links:
+                    st.warning("Cole ao menos um link antes de rodar.")
+                else:
+                    links_por_plataforma = {"instagram": [], "tiktok": [], "desconhecido": []}
+                    for l in links:
+                        links_por_plataforma[detectar_plataforma(l)].append(l)
+                    st.session_state.job = criar_job_apify(links_por_plataforma, st.session_state.gerar_relatorio_auto)
+                    st.session_state.resultados_df = None
+                    st.session_state.relatorio_texto = ""
+                    st.rerun()
 
-        # ---------------- PÓS-PROCESSAMENTO COMUM ----------------
-        if resultados is not None and not resultados.empty:
+    # ---------------- JOB EM ANDAMENTO: progresso + ETA + cancelar ----------------
+    if job_ativo:
+        job = st.session_state.job
+        st.divider()
+
+        rotulos_fase = {
+            "coleta_apify": "Coletando comentários (Apify)",
+            "ler_pulsar": "Lendo a planilha do Pulsar",
+            "preparar_classificacao": "Preparando classificação",
+            "classificacao": "Classificando sentimento (Gemini, em lotes)",
+            "preparar_analise": "Preparando análise aprofundada",
+            "analise_blocos": "Analisando comentários em blocos (Gemini)",
+            "sintese": "Sintetizando o relatório final",
+        }
+        st.info(f"⏳ {rotulos_fase.get(job['fase'], job['fase'])}...")
+
+        fracao = min(job["passos_concluidos"] / max(job["total_passos"], 1), 0.99)
+        st.progress(fracao, text=f"Passo {job['passos_concluidos']} de ~{job['total_passos']}")
+
+        if job["tempos_passo"]:
+            media = sum(job["tempos_passo"]) / len(job["tempos_passo"])
+            restantes = max(job["total_passos"] - job["passos_concluidos"], 0)
+            st.caption(f"⏱️ Tempo estimado restante: ~{formatar_duracao(media * restantes)}")
+
+        if job.get("erro_msg"):
+            st.warning(job["erro_msg"])
+
+        cancelar = st.button("🛑 Cancelar processamento")
+        if cancelar:
+            job["fase"] = "cancelado"
+            log("Processamento cancelado pelo usuário.")
+            st.session_state.job = job
+            st.rerun()
+        else:
+            t0 = time.time()
+            processar_passo_job(job)
+            job["tempos_passo"].append(time.time() - t0)
+            job["passos_concluidos"] += 1
+            st.session_state.job = job
+            time.sleep(0.05)
+            st.rerun()
+
+    # ---------------- JOB CONCLUÍDO: monta resultados_df/relatorio a partir do job ----------------
+    if st.session_state.job is not None and st.session_state.job["fase"] == "concluido":
+        job = st.session_state.job
+        linhas = job["linhas_prontas"]
+        if linhas:
+            resultados = pd.DataFrame(linhas)
             resultados["origem"] = st.session_state.origem
             resultados["campanha"] = st.session_state.campanha
             resultados["marca"] = st.session_state.marca
             resultados["mother_brand"] = st.session_state.mother_brand
             resultados["nucleo"] = st.session_state.nucleo
             st.session_state.resultados_df = resultados
+            st.session_state.relatorio_texto = job["relatorio_final"]
+            msg = (
+                f"Pronto! {len(resultados)} comentários processados em "
+                f"{formatar_duracao(time.time() - job['inicio'])}."
+            )
+            if job["fonte"] == "apify" and job["custo_total"]:
+                msg += f" Custo da coleta: **${job['custo_total']:.2f}** (registrado em 💰 Gastos)."
+            st.success(msg)
+        else:
+            st.warning("Nenhum comentário processado.")
+        st.session_state.job = None
 
-            if st.session_state.gerar_relatorio_auto:
-                with st.spinner("Gerando a análise aprofundada..."):
-                    st.session_state.relatorio_texto = gerar_relatorio(resultados)
-            else:
-                st.session_state.relatorio_texto = ""
-
-            st.success(f"Pronto! {len(resultados)} comentários processados.")
+    if st.session_state.job is not None and st.session_state.job["fase"] == "cancelado":
+        st.warning("Processamento cancelado. Nenhum resultado foi salvo desta execução.")
+        st.session_state.job = None
 
     # ---------------- RESULTADOS (aparecem assim que existirem) ----------------
     resultados = st.session_state.resultados_df
@@ -936,19 +1313,61 @@ with tabs["🚀 Análise"]:
                          color_discrete_map=SENTIMENT_COLORS, title="Sentimento por plataforma", barmode="stack")
             st.plotly_chart(fig, use_container_width=True)
 
+        tem_alvo = "alvo" in resultados.columns
+        if tem_alvo:
+            st.markdown("##### 🎯 Análise por alvo (apenas Apify)")
+            st.caption(
+                "Sobre o que os comentários falam — conteúdo, marca, produto/serviço ou preço. "
+                "Os percentuais consideram só Positivo + Negativo por alvo (Neutros não entram na contagem)."
+            )
+            avaliaveis = resultados[resultados["sentimento"].isin(["Positivo", "Negativo"])]
+            linhas_alvo = []
+            for alvo_nome, grupo in avaliaveis.groupby("alvo"):
+                p = int(grupo["sentimento"].eq("Positivo").sum())
+                n = int(grupo["sentimento"].eq("Negativo").sum())
+                base = p + n
+                linhas_alvo.append({
+                    "alvo": alvo_nome, "positivos": p, "negativos": n,
+                    "% positivo": f"{p/base:.0%}" if base else "-",
+                    "% negativo": f"{n/base:.0%}" if base else "-",
+                    "neutros (fora da contagem)": int((resultados["alvo"] == alvo_nome).sum() - base),
+                })
+            st.dataframe(pd.DataFrame(linhas_alvo), use_container_width=True)
+
+            fig_alvo = px.bar(
+                resultados.groupby(["alvo", "sentimento"]).size().reset_index(name="quantidade"),
+                x="alvo", y="quantidade", color="sentimento", color_discrete_map=SENTIMENT_COLORS,
+                title="Sentimento por alvo", barmode="stack",
+            )
+            st.plotly_chart(fig_alvo, use_container_width=True)
+
         st.markdown("##### Consultar comentários")
-        filtro = st.multiselect(
-            "Mostrar sentimentos", ["Positivo", "Neutro", "Negativo"],
-            default=["Positivo", "Neutro", "Negativo"],
-        )
-        st.dataframe(resultados[resultados["sentimento"].isin(filtro)], use_container_width=True)
+        if tem_alvo:
+            c1, c2 = st.columns(2)
+            filtro_sent = c1.multiselect(
+                "Mostrar sentimentos", ["Positivo", "Neutro", "Negativo"],
+                default=["Positivo", "Neutro", "Negativo"],
+            )
+            alvos_disponiveis = sorted(resultados["alvo"].dropna().unique().tolist())
+            filtro_alvo = c2.multiselect("Mostrar alvos", alvos_disponiveis, default=alvos_disponiveis)
+            mascara = resultados["sentimento"].isin(filtro_sent) & resultados["alvo"].isin(filtro_alvo)
+        else:
+            filtro_sent = st.multiselect(
+                "Mostrar sentimentos", ["Positivo", "Neutro", "Negativo"],
+                default=["Positivo", "Neutro", "Negativo"],
+            )
+            mascara = resultados["sentimento"].isin(filtro_sent)
+        st.dataframe(resultados[mascara], use_container_width=True)
 
         st.markdown("##### 📋 Exemplos de comentários Neutros (para levar a clientes)")
         neutros = resultados[resultados["sentimento"] == "Neutro"]
         if neutros.empty:
             st.caption("Nenhum comentário classificado como Neutro nesta rodada.")
         else:
-            st.dataframe(neutros[["post_link", "autor", "comentario", "justificativa"]], use_container_width=True)
+            colunas_neutros = ["post_link", "autor", "comentario", "justificativa"]
+            if tem_alvo:
+                colunas_neutros.insert(3, "alvo")
+            st.dataframe(neutros[colunas_neutros], use_container_width=True)
             st.download_button(
                 "⬇️ Baixar exemplos neutros (CSV)",
                 data=neutros.to_csv(index=False).encode("utf-8"),
@@ -1114,32 +1533,83 @@ if "⚙️ Configurações" in tabs:
             )
 
         with subtab_prompts:
-            st.markdown("#### Prompt de sentimentalização")
             st.caption(
-                "Usado para classificar cada comentário. Placeholders: "
-                "`{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{COMENTARIO}}`."
+                "A análise completa roda em 3 etapas de prompt: 1) classifica o sentimento em "
+                "lotes de comentários, 2) lê cada bloco de comentários e extrai um resumo fiel, "
+                "3) sintetiza todos os resumos num relatório final único."
+            )
+            st.markdown("#### 1a. Prompt de sentimentalização — Pulsar (reclassificação)")
+            st.caption(
+                f"Usado só quando a fonte é Pulsar e a caixa 'Reclassificar com Gemini' está marcada. "
+                f"Classifica um lote de até {TAMANHO_LOTE_CLASSIFICACAO} comentários por chamada. "
+                "Placeholders: `{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{COMENTARIOS_NUMERADOS}}`."
             )
             st.session_state.prompt_sentimento = st.text_area(
-                "Prompt de sentimentalização", value=st.session_state.prompt_sentimento, height=220
+                "Prompt de sentimentalização (Pulsar)", value=st.session_state.prompt_sentimento, height=200
             )
             c1, c2 = st.columns(2)
-            if c1.button("💾 Salvar prompt de sentimentalização"):
+            if c1.button("💾 Salvar prompt de sentimentalização (Pulsar)"):
                 salvar_prompts()
-                log("Prompt de sentimentalização atualizado.")
+                log("Prompt de sentimentalização (Pulsar) atualizado.")
                 st.success("Salvo.")
-            if c2.button("↩️ Restaurar prompt padrão de sentimentalização"):
+            if c2.button("↩️ Restaurar prompt padrão (Pulsar)"):
                 st.session_state.prompt_sentimento = DEFAULT_PROMPT_SENTIMENTO
                 salvar_prompts()
                 st.rerun()
 
             st.divider()
-            st.markdown("#### Prompt do relatório aprofundado")
+            st.markdown("#### 1b. Prompt de sentimentalização — Apify (com alvo, emoção e pertinência)")
             st.caption(
+                "Usado só para comentários coletados via Apify (Campanha BR / SIC). Além do "
+                "sentimento, classifica o **alvo** do comentário (conteúdo/marca/produto-serviço/"
+                "preço), a **emoção** predominante e a **pertinência** com a campanha — dá pra "
+                "filtrar as amostras por essas categorias depois. Placeholders: `{{CAMPANHA}}`, "
+                "`{{MARCA}}`, `{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{COMENTARIOS_NUMERADOS}}`."
+            )
+            st.session_state.prompt_sentimento_apify = st.text_area(
+                "Prompt de sentimentalização (Apify)", value=st.session_state.prompt_sentimento_apify, height=260
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("💾 Salvar prompt de sentimentalização (Apify)"):
+                salvar_prompts()
+                log("Prompt de sentimentalização (Apify) atualizado.")
+                st.success("Salvo.")
+            if c2.button("↩️ Restaurar prompt padrão (Apify)"):
+                st.session_state.prompt_sentimento_apify = DEFAULT_PROMPT_SENTIMENTO_APIFY
+                salvar_prompts()
+                st.rerun()
+
+            st.divider()
+            st.markdown("#### 2. Prompt de leitura por bloco (análise aprofundada)")
+            st.caption(
+                f"Lê um bloco de até {TAMANHO_CHUNK_ANALISE} comentários e extrai um resumo fiel — "
+                "essa é a etapa que garante que o relatório final não fuja do que está realmente "
+                "escrito nos comentários. Placeholders: `{{CONTEXTO}}`, `{{TOTAL_BLOCO}}`, "
+                "`{{COMENTARIOS_BLOCO}}`."
+            )
+            st.session_state.prompt_analise_bloco = st.text_area(
+                "Prompt de análise por bloco", value=st.session_state.prompt_analise_bloco, height=200
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("💾 Salvar prompt de análise por bloco"):
+                salvar_prompts()
+                log("Prompt de análise por bloco atualizado.")
+                st.success("Salvo.")
+            if c2.button("↩️ Restaurar prompt padrão de análise por bloco"):
+                st.session_state.prompt_analise_bloco = DEFAULT_PROMPT_ANALISE_BLOCO
+                salvar_prompts()
+                st.rerun()
+
+            st.divider()
+            st.markdown("#### 3. Prompt de síntese (relatório final)")
+            st.caption(
+                "Junta todos os resumos de blocos + o resumo quantitativo num relatório final único. "
                 "Placeholders: `{{CAMPANHA}}`, `{{MARCA}}`, `{{MOTHER_BRAND}}`, `{{NUCLEO}}`, "
-                "`{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{RESUMO_QUANTITATIVO}}`, `{{AMOSTRA_COMENTARIOS}}`."
+                "`{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{RESUMO_QUANTITATIVO}}`, `{{RESUMOS_DOS_BLOCOS}}`, "
+                "`{{AMOSTRA_COMENTARIOS}}`."
             )
             st.session_state.prompt_relatorio = st.text_area(
-                "Prompt do relatório aprofundado", value=st.session_state.prompt_relatorio, height=260
+                "Prompt do relatório aprofundado (síntese)", value=st.session_state.prompt_relatorio, height=260
             )
             c1, c2 = st.columns(2)
             if c1.button("💾 Salvar prompt do relatório"):
@@ -1229,6 +1699,6 @@ with tabs["🪵 Log"]:
         st.code("\n".join(st.session_state.log), language=None)
 
     if st.button("🔄 Limpar resultado atual (comentários, sentimento e relatório)"):
-        for key in ("links_input", "resultados_df", "relatorio_texto", "log"):
+        for key in ("links_input", "resultados_df", "relatorio_texto", "log", "job"):
             st.session_state[key] = DEFAULTS[key]
         st.rerun()
