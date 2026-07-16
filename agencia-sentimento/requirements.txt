@@ -1,0 +1,10 @@
+streamlit>=1.42
+Authlib>=1.3.2
+pandas>=2.0
+openpyxl>=3.1
+plotly>=5.20
+apify-client>=1.7
+google-cloud-bigquery>=3.20
+google-auth>=2.29
+google-generativeai>=0.7
+db-dtypes>=1.2
