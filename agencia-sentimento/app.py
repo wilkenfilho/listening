@@ -1,15 +1,14 @@
 """
-Painel de Análise de Sentimentos em Comentários (SIC + Campanhas BR)
-Pipeline: Links/contexto -> Apify (coleta) -> Gemini (sentimentalização automática)
-          -> Sentimentalização (visão geral) -> Relatório aprofundado -> Salvar/Exportar
+Painel de Análise de Sentimentos em Comentários (Apify: SIC + Campanhas BR | Pulsar: planilha)
+Fluxo em uma tela só: escolhe a fonte, preenche o contexto, clica em um botão e
+recebe coleta/leitura + sentimentalização + relatório aprofundado de uma vez.
 Inclui: gastos por extração/usuário, login Google restrito ao domínio, menu de
-Configurações restrito ao admin (chaves de API, prompts do Gemini e acesso de usuários),
-coleta de Posts/Reels/Perfis do Instagram (métricas) e enriquecimento automático dos
-comentários com números do post (curtidas, comentários, views).
+Configurações restrito ao admin (chaves de API, prompts do Gemini e acesso de usuários).
 """
 
 import io
 import json
+import math
 import os
 import random
 import time
@@ -38,78 +37,50 @@ ACTOR_INSTAGRAM_POSTS = "shu8hvrXbJbY3Eb9W"  # Instagram Scraper (posts/reels/pe
 
 RATE_PER_1000 = {"instagram": 1.90, "tiktok": 0.50, "instagram_posts": 1.50}
 SENTIMENT_COLORS = {"Positivo": "#22C55E", "Neutro": "#94A3B8", "Negativo": "#EF4444"}
-ORIGENS = ["Campanha BR (Apify)", "SIC - Reels", "SIC - TikTok"]
+ORIGENS_APIFY = ["Campanha BR (Apify)", "SIC - Reels", "SIC - TikTok"]
+FONTES = ["Apify (links de Instagram/TikTok)", "Pulsar (planilha exportada)"]
+
+# Processamento em chunks (evita 1 chamada de Gemini por comentário e evita
+# que o relatório aprofundado dependa de uma amostra pequena e não-fiel).
+TAMANHO_LOTE_CLASSIFICACAO = 25   # comentários classificados por chamada de Gemini
+TAMANHO_CHUNK_ANALISE = 150       # comentários lidos por chamada na análise aprofundada
+TAMANHO_LOTE_SAUDABILIDADE = 20   # posts avaliados por chamada de Gemini (saudabilidade)
+
+# Constantes (aproximadas) usadas só para estimar o ETA mostrado na tela.
+SEG_POR_LOTE_CLASSIFICACAO = 6
+SEG_POR_CHUNK_ANALISE = 10
+SEG_SINTESE_FINAL = 12
+SEG_POR_PLATAFORMA_APIFY = 25  # o tempo real do Actor varia bastante — é só uma referência
+SEG_METRICAS_IG = 15
+SEG_POR_LOTE_SAUDABILIDADE = 6
+
+TIPOS_ESTUDO = [
+    "Marca própria",
+    "Estudo de concorrência",
+    "Marca própria + concorrência",
+    "Comportamental / cultural (sem marca específica)",
+]
+TIPOS_MARCA = ["Própria", "Concorrente"]
+
+
+def nova_marca() -> dict:
+    return {"nome": "", "tipo": "Própria", "o_que_faz": "", "produtos": [""]}
+
+
+def novo_tema() -> dict:
+    return {"nome": "", "descricao": ""}
+
+PULSAR_SENTIMENT_MAP = {
+    "positive": "Positivo",
+    "negative": "Negativo",
+    "neutral": "Neutro",
+    "not_evaluable": "Neutro",
+}
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-USERS_FILE = os.path.join(DATA_DIR, "usuarios_permitidos.json")
-PROMPTS_FILE = os.path.join(DATA_DIR, "prompts.json")
-
-DEFAULT_PROMPT_SENTIMENTO = """Você é um analista de social listening de uma agência de marketing.
-Classifique o sentimento do comentário abaixo em uma destas categorias: Positivo, Negativo ou Neutro.
-
-Briefing do conteúdo: {{BRIEFING}}
-Diretrizes da marca para esta análise: {{DIRETRIZES}}
-
-Comentário: "{{COMENTARIO}}"
-
-Responda SOMENTE em JSON, neste formato exato:
-{"sentimento": "Positivo", "justificativa": "explicação curta em português"}"""
-
-DEFAULT_PROMPT_RELATORIO = """Você é um analista sênior de social listening e antropologia digital, \
-escrevendo um relatório para apresentar a clientes de uma agência de marketing.
-
-Campanha/conteúdo: {{CAMPANHA}}
-Marca: {{MARCA}} | Mother brand: {{MOTHER_BRAND}} | Núcleo: {{NUCLEO}}
-Briefing do conteúdo: {{BRIEFING}}
-Diretrizes da marca: {{DIRETRIZES}}
-
-Resumo quantitativo dos comentários analisados:
-{{RESUMO_QUANTITATIVO}}
-
-Amostra de comentários por sentimento:
-{{AMOSTRA_COMENTARIOS}}
-
-Escreva uma análise aprofundada, técnica e dissertativa (não apenas bullets soltos) cobrindo,
-nesta ordem:
-1. Panorama geral do engajamento e do sentimento do público.
-2. Insights sobre o comportamento e a percepção do público.
-3. Oportunidades para a marca.
-4. Riscos e pontos de atenção.
-5. Uma leitura antropológica/cultural do que os comentários revelam sobre esse público.
-6. Conclusão, amarrando os pontos acima em forma de storytelling.
-
-Escreva em português, tom técnico mas acessível, como material de estudo entregável ao cliente."""
-
-DEFAULT_PROMPT_SAUDABILIDADE = """Você é um analista de social listening avaliando a 'saudabilidade' \
-(saúde do engajamento e da percepção do público) de um post/conteúdo, com base no sentimento dos
-comentários já analisados e nas métricas do post.
-
-Marca: {{MARCA}} | Campanha: {{CAMPANHA}}
-Diretrizes da marca: {{DIRETRIZES}}
-
-Distribuição de sentimento dos comentários analisados:
-{{RESUMO_SENTIMENTO}}
-
-Métricas do post: {{METRICAS_POST}}
-
-Com base nisso, avalie a saudabilidade deste post/conteúdo para a marca.
-Responda SOMENTE em JSON, neste formato exato:
-{"saudabilidade_score": 0, "classificacao": "Saudável", "resumo": "explicação curta em português, 1-2 frases"}
-
-Onde "saudabilidade_score" é um número de 0 a 100 (100 = ótima recepção do público, sem riscos;
-0 = crise/rejeição forte do público) e "classificacao" é uma destas: "Saudável", "Atenção" ou "Crítico"."""
-
-STAGES = [
-    {"label": "Links + contexto", "color": "#FDE68A"},
-    {"label": "Apify (coleta)", "color": "#FDE68A"},
-    {"label": "Gemini (sentimentalização)", "color": "#FBCFA6"},
-    {"label": "Sentimentalização", "color": "#BFDBFE"},
-    {"label": "Relatório aprofundado", "color": "#BFDBFE"},
-    {"label": "Salvar / Exportar", "color": "#BFDBFE"},
-]
 
 # Amostras usadas somente em modo demonstração (Apify não configurado), para a
-# aba de Posts/Reels/Perfis do Instagram continuar navegável offline.
+# aba de Posts/Reels/Perfis e o enriquecimento de métricas continuarem navegáveis offline.
 DEMO_POSTS_SAMPLE = [
     {
         "inputUrl": "https://www.instagram.com/natgeo/",
@@ -172,26 +143,145 @@ DEMO_PERFIL_SAMPLE = [
         "postsCount": 5863,
     }
 ]
+USERS_FILE = os.path.join(DATA_DIR, "usuarios_permitidos.json")
+PROMPTS_FILE = os.path.join(DATA_DIR, "prompts.json")
+
+DEFAULT_PROMPT_SENTIMENTO = """Você é um analista de social listening de uma agência de marketing.
+Classifique o sentimento de CADA comentário da lista abaixo em Positivo, Negativo ou Neutro.
+Seja fiel e literal ao que está escrito em cada comentário — não invente, não extrapole e não
+generalize além do que o texto realmente diz.
+
+Briefing do conteúdo: {{BRIEFING}}
+Diretrizes da marca para esta análise: {{DIRETRIZES}}
+
+Comentários (numerados):
+{{COMENTARIOS_NUMERADOS}}
+
+Responda SOMENTE em JSON, uma lista com um item por comentário, na mesma ordem numerada, neste
+formato exato:
+[{"indice": 1, "sentimento": "Positivo", "justificativa": "explicação curta em português"}, {"indice": 2, "sentimento": "Neutro", "justificativa": "..."}]"""
+
+DEFAULT_PROMPT_SENTIMENTO_APIFY = """Você é um analista de sentimento especializado em comentários de redes sociais.
+
+Contexto da campanha: {{CAMPANHA}}
+Marca: {{MARCA}}
+Briefing do conteúdo: {{BRIEFING}}
+Diretrizes da marca: {{DIRETRIZES}}
+
+Para CADA comentário da lista numerada abaixo, classifique com base estritamente no que está
+escrito — não invente nem extrapole:
+- sentimento: "Positivo", "Negativo" ou "Neutro"
+- alvo: sobre o que o comentário fala — "conteúdo" (o vídeo/post/criador em si), "marca",
+  "produto/serviço" ou "preço"
+- emocao: a emoção predominante (ex: alegria, raiva, surpresa, desprezo, indiferença, admiração...)
+- pertinencia: "pertinente" se o comentário tem relação com o post, a marca, o produto/serviço ou
+  o preço; "não_pertinente" se for genérico, spam, ou sem relação nenhuma com a campanha
+- justificativa: explicação curta em português
+
+Comentários (numerados):
+{{COMENTARIOS_NUMERADOS}}
+
+Responda SOMENTE em JSON, uma lista com um item por comentário, na mesma ordem numerada, neste
+formato exato:
+[{"indice": 1, "sentimento": "Positivo", "alvo": "marca", "emocao": "alegria", "pertinencia": "pertinente", "justificativa": "..."}]
+
+Regras importantes: a soma de itens classificados nunca deve ultrapassar o total de comentários
+enviados, e cada comentário recebe exatamente uma classificação de cada campo."""
+
+DEFAULT_PROMPT_ANALISE_BLOCO = """Você é um analista de social listening. Leia com atenção o bloco de
+comentários abaixo e responda de forma estritamente fiel ao que está escrito — não invente
+temas, exemplos ou conclusões que não estejam apoiados nos comentários deste bloco.
+
+Contexto do estudo: {{CONTEXTO}}
+
+Bloco de comentários ({{TOTAL_BLOCO}} comentários):
+{{COMENTARIOS_BLOCO}}
+
+Responda em português, em tópicos objetivos, cobrindo:
+- Principais temas e assuntos recorrentes neste bloco.
+- Padrões de sentimento observados (com 2-3 exemplos curtos e literais, sem inventar).
+- Sinais de oportunidade, se houver.
+- Sinais de risco ou crítica, se houver.
+Seja direto e conciso — isto é um resumo intermediário, não o relatório final."""
+
+DEFAULT_PROMPT_RELATORIO = """Você é um analista sênior de social listening e antropologia digital, \
+escrevendo um relatório para apresentar a clientes de uma agência de marketing.
+
+Campanha/conteúdo: {{CAMPANHA}}
+Marca: {{MARCA}} | Mother brand: {{MOTHER_BRAND}} | Núcleo: {{NUCLEO}}
+Briefing do conteúdo: {{BRIEFING}}
+Diretrizes da marca: {{DIRETRIZES}}
+
+Resumo quantitativo dos comentários analisados:
+{{RESUMO_QUANTITATIVO}}
+
+Resumos fiéis de cada bloco de comentários (esta é a base factual real da análise —
+use isto como fonte principal, não invente nada além do que está aqui):
+{{RESUMOS_DOS_BLOCOS}}
+
+Amostra de comentários literais, para ilustrar com citações reais:
+{{AMOSTRA_COMENTARIOS}}
+
+Escreva uma análise aprofundada, técnica e dissertativa (não apenas bullets soltos) cobrindo,
+nesta ordem:
+1. Panorama geral do engajamento e do sentimento do público.
+2. Insights sobre o comportamento e a percepção do público.
+3. Oportunidades para a marca.
+4. Riscos e pontos de atenção.
+5. Uma leitura antropológica/cultural do que os comentários revelam sobre esse público.
+6. Conclusão, amarrando os pontos acima em forma de storytelling.
+
+Mantenha-se estritamente fiel aos resumos dos blocos e aos comentários — não fuja do assunto
+nem introduza informação externa que não esteja apoiada no material fornecido. Escreva em
+português, tom técnico mas acessível, como material de estudo entregável ao cliente."""
+
+DEFAULT_PROMPT_SAUDABILIDADE = """Você é um analista de social listening avaliando a 'saudabilidade' \
+(saúde do engajamento e da percepção do público) de cada post/conteúdo abaixo, com base na
+distribuição de sentimento dos comentários já analisados e nas métricas do post.
+
+Marca: {{MARCA}} | Campanha: {{CAMPANHA}}
+Diretrizes da marca: {{DIRETRIZES}}
+
+Posts (numerados):
+{{POSTS_NUMERADOS}}
+
+Para CADA post da lista numerada, avalie a saudabilidade dele para a marca — considere o
+equilíbrio entre sentimento do público e as métricas de engajamento (quando disponíveis).
+Responda SOMENTE em JSON, uma lista com um item por post, na mesma ordem numerada, neste
+formato exato:
+[{"indice": 1, "saudabilidade_score": 0, "classificacao": "Saudável", "resumo": "explicação curta em português, 1-2 frases"}]
+
+Onde "saudabilidade_score" é um número de 0 a 100 (100 = ótima recepção do público, sem riscos;
+0 = crise/rejeição forte do público) e "classificacao" é uma destas: "Saudável", "Atenção" ou
+"Crítico". Nunca ultrapasse o total de posts enviados e mantenha a mesma ordem numerada."""
 
 # ----------------------------------------------------------------------
 # ESTADO DA SESSÃO
 # ----------------------------------------------------------------------
 DEFAULTS = {
+    "fonte": FONTES[0],
     "links_input": "",
-    "links_list": [],
-    "origem": ORIGENS[0],
+    "origem": ORIGENS_APIFY[0],
     "campanha": "",
     "marca": "",
     "mother_brand": "",
     "nucleo": "",
     "briefing": "",
     "diretrizes_marca": "",
-    "comentarios_df": None,
+    "estudo_nome": "",
+    "estudo_objetivo": "",
+    "tipo_estudo": TIPOS_ESTUDO[0],
+    "marcas_estudo": [nova_marca()],
+    "temas_estudo": [novo_tema()],
+    "diretrizes_extra": "",
+    "reclassificar_pulsar_gemini": False,
+    "gerar_relatorio_auto": True,
+    "buscar_metricas_posts": True,
     "resultados_df": None,
     "relatorio_texto": "",
     "apify_token": "",
     "gemini_key": "",
-    "gemini_model": "gemini-2.0-flash",
+    "gemini_model": "gemini-flash-lite-latest",
     "bq_project": "",
     "bq_dataset": "",
     "bq_table_post_comments": "post_comments",
@@ -199,7 +289,6 @@ DEFAULTS = {
     "bq_table_usuarios": "usuarios_permitidos",
     "bq_table_posts_ig": "posts_instagram",
     "bq_credentials_json": None,
-    "current_stage": 0,
     "log": [],
     "gastos": [],
     "usuario_atual": "convidado",
@@ -208,10 +297,12 @@ DEFAULTS = {
     "pode_configurar": False,
     "usuarios_permitidos": None,
     "prompt_sentimento": DEFAULT_PROMPT_SENTIMENTO,
+    "prompt_sentimento_apify": DEFAULT_PROMPT_SENTIMENTO_APIFY,
+    "prompt_analise_bloco": DEFAULT_PROMPT_ANALISE_BLOCO,
     "prompt_relatorio": DEFAULT_PROMPT_RELATORIO,
     "prompt_saudabilidade": DEFAULT_PROMPT_SAUDABILIDADE,
     "prompts_loaded": False,
-    "buscar_metricas_posts": True,
+    "job": None,
     "ig_posts_links_input": "",
     "ig_posts_results_type": "posts",
     "ig_posts_limit": 12,
@@ -332,123 +423,12 @@ def registrar_gasto(plataforma: str, qtd_comentarios: int) -> float:
     return custo
 
 
-def montar_prompt_sentimento(comentario: str) -> str:
-    return (
-        st.session_state.prompt_sentimento.replace(
-            "{{BRIEFING}}", st.session_state.briefing or "Não informado."
-        )
-        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica.")
-        .replace("{{COMENTARIO}}", str(comentario))
-    )
-
-
-def classificar_demo(texto: str) -> str:
-    negativos = ["não gostei", "péssima", "quebrado", "ruim"]
-    positivos = ["adorei", "incrível", "excelente", "recomendo"]
-    t = str(texto).lower()
-    if any(p in t for p in negativos):
-        return "Negativo"
-    if any(p in t for p in positivos):
-        return "Positivo"
-    return "Neutro"
-
-
-# ----------------------------------------------------------------------
-# SAUDABILIDADE POR POST (agrega sentimento + métricas, 1 chamada Gemini por post)
-# ----------------------------------------------------------------------
-def montar_prompt_saudabilidade(resumo_sentimento: str, metricas_texto: str) -> str:
-    return (
-        st.session_state.prompt_saudabilidade.replace(
-            "{{MARCA}}", st.session_state.marca or "Não informado"
-        )
-        .replace("{{CAMPANHA}}", st.session_state.campanha or "Não informado")
-        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica")
-        .replace("{{RESUMO_SENTIMENTO}}", resumo_sentimento)
-        .replace("{{METRICAS_POST}}", metricas_texto)
-    )
-
-
-def classificar_saudabilidade_demo(pos_pct: float, neg_pct: float) -> dict:
-    score = int(max(0, min(100, round(50 + (pos_pct - neg_pct) * 50))))
-    if score >= 70:
-        label = "Saudável"
-    elif score >= 40:
-        label = "Atenção"
-    else:
-        label = "Crítico"
-    return {
-        "saudabilidade_score": score,
-        "classificacao": label,
-        "resumo": f"[DEMO] Estimativa simples: {pos_pct:.0%} positivo vs {neg_pct:.0%} negativo nos comentários.",
-    }
-
-
-def gerar_saudabilidade_post(pos_pct: float, neu_pct: float, neg_pct: float, metricas_texto: str, total_comentarios: int) -> dict:
-    """Calcula a saudabilidade (0-100 + classificação) de um post, via Gemini quando
-    configurado, com fallback para uma estimativa simples baseada no sentimento."""
-    resumo_sentimento = (
-        f"Positivo: {pos_pct:.0%}, Neutro: {neu_pct:.0%}, Negativo: {neg_pct:.0%} "
-        f"(de {total_comentarios} comentários analisados)"
-    )
-    if is_gemini_configured():
-        try:
-            import google.generativeai as genai
-
-            genai.configure(api_key=st.session_state.gemini_key)
-            model = genai.GenerativeModel(st.session_state.gemini_model)
-            prompt = montar_prompt_saudabilidade(resumo_sentimento, metricas_texto)
-            resp = model.generate_content(prompt)
-            parsed = json.loads(resp.text.strip().strip("```json").strip("```"))
-            return {
-                "saudabilidade_score": parsed.get("saudabilidade_score"),
-                "saudabilidade_classificacao": parsed.get("classificacao"),
-                "saudabilidade_resumo": parsed.get("resumo"),
-            }
-        except Exception as e:
-            log(f"Aviso: não foi possível calcular saudabilidade via Gemini ({e}). Usando estimativa simples.")
-
-    demo = classificar_saudabilidade_demo(pos_pct, neg_pct)
-    return {
-        "saudabilidade_score": demo["saudabilidade_score"],
-        "saudabilidade_classificacao": demo["classificacao"],
-        "saudabilidade_resumo": demo["resumo"],
-    }
-
-
-def montar_resumo_por_post(resultados: pd.DataFrame) -> pd.DataFrame:
-    """Agrega a tabela de comentários (post_comments) em uma linha por post, juntando
-    contagem/percentual de sentimento com as métricas do post e a saudabilidade —
-    pensado para virar a aba 'resumo_por_post' no Excel de exportação."""
-    grupo = resultados.groupby("post_link", as_index=False).agg(
-        comentarios_analisados=("comentario", "count"),
-        positivos=("sentimento", lambda s: int((s == "Positivo").sum())),
-        neutros=("sentimento", lambda s: int((s == "Neutro").sum())),
-        negativos=("sentimento", lambda s: int((s == "Negativo").sum())),
-    )
-
-    campos_extra = [
-        "plataforma", "origem", "campanha", "marca", "mother_brand", "nucleo",
-        "likes_post", "comentarios_post", "views_post", "plays_post",
-        "compartilhamentos_post", "tipo_midia", "is_reel", "duracao_video_seg",
-        "data_publicacao_post", "saudabilidade_score", "saudabilidade_classificacao",
-        "saudabilidade_resumo",
-    ]
-    extras_presentes = [c for c in campos_extra if c in resultados.columns]
-    if extras_presentes:
-        extras = resultados.groupby("post_link", as_index=False)[extras_presentes].first()
-        grupo = grupo.merge(extras, on="post_link", how="left")
-
-    total = grupo["comentarios_analisados"].replace(0, pd.NA)
-    grupo["pct_positivo"] = (grupo["positivos"] / total).round(3)
-    grupo["pct_negativo"] = (grupo["negativos"] / total).round(3)
-    return grupo
-
-
 # ----------------------------------------------------------------------
 # POSTS / REELS / PERFIS DO INSTAGRAM (métricas: curtidas, comentários, views...)
 # ----------------------------------------------------------------------
 def coletar_posts_ig(links: list, results_type: str = "posts", limit: int = 12, only_newer_than=None):
-    """Chama o Actor de Posts/Reels/Perfis do Instagram no Apify.
+    """Chama o Actor de Posts/Reels/Perfis do Instagram no Apify (1 chamada cobre
+    vários links de uma vez — o próprio Actor aceita uma lista em 'directUrls').
 
     results_type:
       - "posts"   -> retorna os posts/reels de um perfil, ou o post/reel específico
@@ -469,7 +449,11 @@ def coletar_posts_ig(links: list, results_type: str = "posts", limit: int = 12, 
         "addParentData": False,
     }
     run = client.actor(ACTOR_INSTAGRAM_POSTS).call(run_input=run_input)
-    return list(client.dataset(run["defaultDatasetId"]).iterate_items())
+    if isinstance(run, dict):
+        dataset_id = run.get("defaultDatasetId")
+    else:
+        dataset_id = getattr(run, "default_dataset_id", None) or getattr(run, "defaultDatasetId", None)
+    return list(client.dataset(dataset_id).iterate_items())
 
 
 def normalizar_item_post(item: dict) -> dict:
@@ -520,35 +504,742 @@ def normalizar_item_perfil(item: dict) -> dict:
     }
 
 
-def buscar_metricas_posts_ig(links: list, limit_por_link: int = 1) -> dict:
-    """Busca métricas (curtidas, comentários, views) para uma lista de posts/reels
-    do Instagram e devolve um dicionário {link: métricas} para enriquecer os
-    comentários já coletados. Usado pela aba 'Coletar e analisar'."""
-    links = [l for l in links if l]
-    if not links:
-        return {}
+# ----------------------------------------------------------------------
+# SAUDABILIDADE POR POST (agrega sentimento + métricas, em lote via Gemini)
+# ----------------------------------------------------------------------
+def montar_prompt_saudabilidade(posts_numerados: str) -> str:
+    return (
+        st.session_state.prompt_saudabilidade.replace(
+            "{{MARCA}}", st.session_state.marca or "Não informado"
+        )
+        .replace("{{CAMPANHA}}", st.session_state.campanha or "Não informado")
+        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica")
+        .replace("{{POSTS_NUMERADOS}}", posts_numerados)
+    )
 
-    if is_apify_configured():
-        try:
-            items = coletar_posts_ig(links, results_type="posts", limit=limit_por_link)
-            if items:
-                custo = registrar_gasto("instagram_posts", len(items))
-                log(f"Actor de posts/perfis IG retornou {len(items)} item(ns) — custo: ${custo:.4f}.")
-        except Exception as e:
-            log(f"Aviso: não foi possível buscar métricas dos posts do Instagram ({e}).")
-            return {}
+
+def classificar_saudabilidade_demo(pos_pct: float, neg_pct: float) -> dict:
+    score = int(max(0, min(100, round(50 + (pos_pct - neg_pct) * 50))))
+    if score >= 70:
+        label = "Saudável"
+    elif score >= 40:
+        label = "Atenção"
     else:
-        items = DEMO_POSTS_SAMPLE
+        label = "Crítico"
+    return {
+        "saudabilidade_score": score,
+        "classificacao": label,
+        "resumo": f"[DEMO] Estimativa simples: {pos_pct:.0%} positivo vs {neg_pct:.0%} negativo nos comentários.",
+    }
 
-    metricas = {}
-    for item in items:
-        if "shortCode" not in item:
+
+def classificar_saudabilidade_lote_gemini(model, lote_info: list) -> dict:
+    """lote_info: lista de dicts {post_link, resumo_sentimento, metricas_texto}.
+    Retorna {post_link: {saudabilidade_score, saudabilidade_classificacao, saudabilidade_resumo}}."""
+    numerados = "\n".join(
+        f"{i+1}. Post: {info['post_link']}\n   Sentimento: {info['resumo_sentimento']}\n   Métricas: {info['metricas_texto']}"
+        for i, info in enumerate(lote_info)
+    )
+    prompt = montar_prompt_saudabilidade(numerados)
+    resp = model.generate_content(prompt)
+    mapa = {}
+    try:
+        parsed = json.loads(resp.text.strip().strip("```json").strip("```"))
+        mapa = {int(item.get("indice", 0)): item for item in parsed if isinstance(item, dict)}
+    except Exception:
+        mapa = {}
+    resultado = {}
+    for i, info in enumerate(lote_info):
+        item = mapa.get(i + 1, {})
+        resultado[info["post_link"]] = {
+            "saudabilidade_score": item.get("saudabilidade_score"),
+            "saudabilidade_classificacao": item.get("classificacao", "Atenção"),
+            "saudabilidade_resumo": item.get("resumo", "[sem retorno estruturado do Gemini para este item]"),
+        }
+    return resultado
+
+
+def classificar_saudabilidade_lote_demo(lote_info: list) -> dict:
+    resultado = {}
+    for info in lote_info:
+        demo = classificar_saudabilidade_demo(info.get("pos_pct", 0), info.get("neg_pct", 0))
+        resultado[info["post_link"]] = {
+            "saudabilidade_score": demo["saudabilidade_score"],
+            "saudabilidade_classificacao": demo["classificacao"],
+            "saudabilidade_resumo": demo["resumo"],
+        }
+    return resultado
+
+
+def montar_resumo_por_post(resultados: pd.DataFrame) -> pd.DataFrame:
+    """Agrega a tabela de comentários (post_comments) em uma linha por post, juntando
+    contagem/percentual de sentimento com as métricas do post e a saudabilidade —
+    usado na aba de resultados e na exportação Excel completa."""
+    grupo = resultados.groupby("post_link", as_index=False).agg(
+        comentarios_analisados=("comentario", "count"),
+        positivos=("sentimento", lambda s: int((s == "Positivo").sum())),
+        neutros=("sentimento", lambda s: int((s == "Neutro").sum())),
+        negativos=("sentimento", lambda s: int((s == "Negativo").sum())),
+    )
+
+    campos_extra = [
+        "plataforma", "origem", "campanha", "marca", "mother_brand", "nucleo",
+        "likes_post", "comentarios_post", "views_post", "plays_post",
+        "compartilhamentos_post", "tipo_midia", "is_reel", "duracao_video_seg",
+        "data_publicacao_post", "saudabilidade_score", "saudabilidade_classificacao",
+        "saudabilidade_resumo",
+    ]
+    extras_presentes = [c for c in campos_extra if c in resultados.columns]
+    if extras_presentes:
+        extras = resultados.groupby("post_link", as_index=False)[extras_presentes].first()
+        grupo = grupo.merge(extras, on="post_link", how="left")
+
+    total = grupo["comentarios_analisados"].replace(0, pd.NA)
+    grupo["pct_positivo"] = (grupo["positivos"] / total).round(3)
+    grupo["pct_negativo"] = (grupo["negativos"] / total).round(3)
+    return grupo
+
+
+def montar_contexto_marcas() -> str:
+    partes = []
+    for m in st.session_state.marcas_estudo:
+        if not m["nome"].strip():
             continue
-        linha = normalizar_item_post(item)
-        chave = linha["link"]
-        if chave:
-            metricas[chave] = linha
-    return metricas
+        produtos = [p.strip() for p in m["produtos"] if p.strip()]
+        bloco = f"Marca: {m['nome']} ({m['tipo']})\nO que faz: {m['o_que_faz'].strip() or 'Não informado'}"
+        if produtos:
+            bloco += f"\nProdutos: {', '.join(produtos)}"
+        partes.append(bloco)
+    return "\n\n".join(partes) if partes else ""
+
+
+def montar_contexto_temas() -> str:
+    partes = []
+    for t in st.session_state.temas_estudo:
+        if not t["nome"].strip():
+            continue
+        bloco = f"Tema/comportamento: {t['nome']}"
+        if t["descricao"].strip():
+            bloco += f"\nDescrição: {t['descricao'].strip()}"
+        partes.append(bloco)
+    return "\n\n".join(partes) if partes else ""
+
+
+def mapear_contexto_pulsar():
+    """Traduz o formulário de estudo/marcas/produtos/temas do Pulsar para os campos
+    (campanha, marca, mother_brand, briefing, diretrizes_marca) já usados
+    pelos prompts do Gemini e pelas exportações."""
+    proprias = [m["nome"] for m in st.session_state.marcas_estudo if m["tipo"] == "Própria" and m["nome"].strip()]
+    concorrentes = [m["nome"] for m in st.session_state.marcas_estudo if m["tipo"] == "Concorrente" and m["nome"].strip()]
+
+    st.session_state.campanha = st.session_state.estudo_nome
+    st.session_state.marca = ", ".join(proprias) if proprias else "Não informado"
+    st.session_state.mother_brand = ", ".join(concorrentes) if concorrentes else ""
+    st.session_state.briefing = st.session_state.estudo_objetivo
+
+    blocos = [f"Tipo de estudo: {st.session_state.tipo_estudo}"]
+    contexto_marcas = montar_contexto_marcas()
+    if contexto_marcas:
+        blocos.append(contexto_marcas)
+    contexto_temas = montar_contexto_temas()
+    if contexto_temas:
+        blocos.append("Temas/comportamentos/tendências em estudo:\n\n" + contexto_temas)
+    if not contexto_marcas and not contexto_temas:
+        blocos.append("Nenhuma marca ou tema específico detalhado — considere apenas o objetivo do estudo acima.")
+    if st.session_state.diretrizes_extra.strip():
+        blocos.append(f"Observações adicionais: {st.session_state.diretrizes_extra.strip()}")
+    st.session_state.diretrizes_marca = "\n\n".join(blocos)
+
+
+def classificar_demo(texto: str) -> str:
+    negativos = ["não gostei", "péssima", "quebrado", "ruim"]
+    positivos = ["adorei", "incrível", "excelente", "recomendo"]
+    t = str(texto).lower()
+    if any(p in t for p in negativos):
+        return "Negativo"
+    if any(p in t for p in positivos):
+        return "Positivo"
+    return "Neutro"
+
+
+def formatar_duracao(segundos: float) -> str:
+    segundos = max(0, int(round(segundos)))
+    m, s = divmod(segundos, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}min"
+    if m:
+        return f"{m}min {s}s"
+    return f"{s}s"
+
+
+def dividir_em_lotes(lista, tamanho):
+    lista = list(lista)
+    return [lista[i:i + tamanho] for i in range(0, len(lista), tamanho)]
+
+
+def classificar_lote_gemini(model, lote_linhas: list) -> list:
+    """Classifica um lote de comentários numa única chamada de Gemini."""
+    numerados = "\n".join(f"{i+1}. {r.get('comentario','')}" for i, r in enumerate(lote_linhas))
+    prompt = (
+        st.session_state.prompt_sentimento
+        .replace("{{BRIEFING}}", st.session_state.briefing or "Não informado.")
+        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica.")
+        .replace("{{COMENTARIOS_NUMERADOS}}", numerados)
+    )
+    resp = model.generate_content(prompt)
+    mapa = {}
+    try:
+        parsed = json.loads(resp.text.strip().strip("```json").strip("```"))
+        mapa = {int(item.get("indice", 0)): item for item in parsed if isinstance(item, dict)}
+    except Exception:
+        mapa = {}
+    resultado = []
+    for i, r in enumerate(lote_linhas):
+        item = mapa.get(i + 1, {})
+        nova = dict(r)
+        nova["sentimento"] = item.get("sentimento", "Neutro")
+        nova["justificativa"] = item.get("justificativa", "[sem retorno estruturado do Gemini para este item]")
+        resultado.append(nova)
+    return resultado
+
+
+def classificar_lote_gemini_apify(model, lote_linhas: list) -> list:
+    """Classificação específica do Apify: sentimento + alvo + emoção + pertinência."""
+    numerados = "\n".join(f"{i+1}. {r.get('comentario','')}" for i, r in enumerate(lote_linhas))
+    prompt = (
+        st.session_state.prompt_sentimento_apify
+        .replace("{{CAMPANHA}}", st.session_state.campanha or "Não informado.")
+        .replace("{{MARCA}}", st.session_state.marca or "Não informado.")
+        .replace("{{BRIEFING}}", st.session_state.briefing or "Não informado.")
+        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica.")
+        .replace("{{COMENTARIOS_NUMERADOS}}", numerados)
+    )
+    resp = model.generate_content(prompt)
+    mapa = {}
+    try:
+        parsed = json.loads(resp.text.strip().strip("```json").strip("```"))
+        mapa = {int(item.get("indice", 0)): item for item in parsed if isinstance(item, dict)}
+    except Exception:
+        mapa = {}
+    resultado = []
+    for i, r in enumerate(lote_linhas):
+        item = mapa.get(i + 1, {})
+        nova = dict(r)
+        nova["sentimento"] = item.get("sentimento", "Neutro")
+        nova["alvo"] = item.get("alvo", "conteúdo")
+        nova["emocao"] = item.get("emocao", "indiferença")
+        nova["pertinencia"] = item.get("pertinencia", "pertinente")
+        nova["justificativa"] = item.get("justificativa", "[sem retorno estruturado do Gemini para este item]")
+        resultado.append(nova)
+    return resultado
+
+
+ALVOS_DEMO = ["conteúdo", "marca", "produto/serviço", "preço"]
+
+
+def classificar_lote_demo(lote_linhas: list, apify: bool = False) -> list:
+    resultado = []
+    for r in lote_linhas:
+        nova = dict(r)
+        sentimento = classificar_demo(nova.get("comentario", ""))
+        nova["sentimento"] = sentimento
+        nova["justificativa"] = "[DEMO] classificação simulada por palavras-chave"
+        if apify:
+            nova["alvo"] = random.choice(ALVOS_DEMO)
+            nova["emocao"] = {"Positivo": "satisfação", "Negativo": "insatisfação", "Neutro": "indiferença"}[sentimento]
+            nova["pertinencia"] = "pertinente"
+        resultado.append(nova)
+    return resultado
+
+
+def analisar_bloco_gemini(model, bloco_comentarios: list, contexto_texto: str) -> str:
+    texto = "\n".join(f'- "{c}"' for c in bloco_comentarios)
+    prompt = (
+        st.session_state.prompt_analise_bloco
+        .replace("{{CONTEXTO}}", contexto_texto)
+        .replace("{{TOTAL_BLOCO}}", str(len(bloco_comentarios)))
+        .replace("{{COMENTARIOS_BLOCO}}", texto)
+    )
+    resp = model.generate_content(prompt)
+    return resp.text
+
+
+def montar_contexto_estudo_texto() -> str:
+    return (
+        f"Campanha/estudo: {st.session_state.campanha or 'Não informado'}\n"
+        f"Marca: {st.session_state.marca or 'Não informado'} | "
+        f"Mother brand: {st.session_state.mother_brand or 'Não informado'} | "
+        f"Núcleo: {st.session_state.nucleo or 'Não informado'}\n"
+        f"Objetivo/briefing: {st.session_state.briefing or 'Não informado'}\n"
+        f"Diretrizes: {st.session_state.diretrizes_marca or 'Nenhuma diretriz específica'}"
+    )
+
+
+def gerar_sintese_final(model, resultados_df: pd.DataFrame, resumos_blocos: list) -> str:
+    contagem = resultados_df["sentimento"].value_counts()
+    total = len(resultados_df)
+    resumo_quant = "\n".join(
+        f"- {s}: {int(contagem.get(s,0))} comentários ({contagem.get(s,0)/total:.0%})"
+        for s in ["Positivo", "Neutro", "Negativo"]
+    )
+    amostra_partes = []
+    for s in ["Positivo", "Neutro", "Negativo"]:
+        exemplos = resultados_df[resultados_df["sentimento"] == s]["comentario"].head(5).tolist()
+        if exemplos:
+            amostra_partes.append(f"{s}:\n" + "\n".join(f'- "{c}"' for c in exemplos))
+    amostra = "\n\n".join(amostra_partes)
+    resumos_texto = "\n\n---\n\n".join(f"[Bloco {i+1}]\n{r}" for i, r in enumerate(resumos_blocos)) or "Nenhum bloco processado."
+
+    prompt = (
+        st.session_state.prompt_relatorio
+        .replace("{{CAMPANHA}}", st.session_state.campanha or "Não informado")
+        .replace("{{MARCA}}", st.session_state.marca or "Não informado")
+        .replace("{{MOTHER_BRAND}}", st.session_state.mother_brand or "Não informado")
+        .replace("{{NUCLEO}}", st.session_state.nucleo or "Não informado")
+        .replace("{{BRIEFING}}", st.session_state.briefing or "Não informado")
+        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica")
+        .replace("{{RESUMO_QUANTITATIVO}}", resumo_quant)
+        .replace("{{RESUMOS_DOS_BLOCOS}}", resumos_texto)
+        .replace("{{AMOSTRA_COMENTARIOS}}", amostra)
+    )
+    resp = model.generate_content(prompt)
+    return resp.text
+
+
+def ler_planilha_pulsar(arquivo) -> pd.DataFrame:
+    """Lê um export do Pulsar (aba 'Contents') e normaliza para o schema do app."""
+    df = pd.read_excel(arquivo, sheet_name="Contents")
+    df = df.dropna(subset=["content"]).copy()
+    out = pd.DataFrame(
+        {
+            "post_link": df.get("url", ""),
+            "plataforma": df.get("source", "desconhecido"),
+            "autor": df.get("user screen name", df.get("user name", "")),
+            "comentario": df["content"],
+            "data_extracao": df.get("date (UTC)", "").astype(str),
+            "sentimento": df.get("sentiment class", "").map(PULSAR_SENTIMENT_MAP).fillna("Neutro"),
+            "justificativa": "Classificação original do Pulsar (sentiment class).",
+        }
+    )
+    return out.reset_index(drop=True)
+
+
+# ----------------------------------------------------------------------
+# MOTOR DE PROCESSAMENTO EM FILA (ETA + barra de progresso + cancelar)
+# ----------------------------------------------------------------------
+def estimar_segundos(n_comentarios: int, n_plataformas_apify: int, precisa_classificar: bool, gerar_relatorio: bool, buscar_metricas: bool = False) -> int:
+    seg = n_plataformas_apify * SEG_POR_PLATAFORMA_APIFY
+    if precisa_classificar and n_comentarios:
+        seg += math.ceil(n_comentarios / TAMANHO_LOTE_CLASSIFICACAO) * SEG_POR_LOTE_CLASSIFICACAO
+    if buscar_metricas and n_comentarios:
+        seg += SEG_METRICAS_IG + SEG_POR_LOTE_SAUDABILIDADE  # pelo menos 1 lote de saudabilidade
+    if gerar_relatorio and n_comentarios:
+        seg += math.ceil(n_comentarios / TAMANHO_CHUNK_ANALISE) * SEG_POR_CHUNK_ANALISE + SEG_SINTESE_FINAL
+    return seg
+
+
+def recomputar_total_passos(job: dict):
+    n = len(job["linhas_coletadas"]) or len(job["linhas_prontas"])
+    passos = job["passos_apify_fixos"]
+    if job["precisa_classificar"] and n:
+        passos += math.ceil(n / TAMANHO_LOTE_CLASSIFICACAO)
+    if job.get("buscar_metricas_posts"):
+        links_ig = job.get("links_instagram_unicos")
+        if links_ig is None:
+            # ainda não sabemos quantos links são do Instagram — soma 1 passo de reserva
+            passos += 1
+        elif links_ig:
+            passos += 1
+        n_posts_unicos = len(job.get("fila_saudabilidade_flat") or [])
+        if n_posts_unicos:
+            passos += math.ceil(n_posts_unicos / TAMANHO_LOTE_SAUDABILIDADE)
+        elif n:
+            passos += 1  # pelo menos 1 lote de saudabilidade estimado
+    if job["gerar_relatorio"] and n:
+        passos += math.ceil(n / TAMANHO_CHUNK_ANALISE) + 1
+    job["total_passos"] = max(passos, job["passos_concluidos"] + 1)
+
+
+def criar_job_apify(links_por_plataforma: dict, gerar_relatorio: bool) -> dict:
+    plataformas_pendentes = [p for p in ("instagram", "tiktok") if links_por_plataforma.get(p)]
+    n_estimado = (
+        len(links_por_plataforma.get("instagram", [])) * st.session_state.ig_limit
+        + len(links_por_plataforma.get("tiktok", [])) * st.session_state.tk_limit
+    )
+    job = {
+        "fonte": "apify",
+        "fase": "coleta_apify" if plataformas_pendentes else "preparar_classificacao",
+        "inicio": time.time(),
+        "links_por_plataforma": links_por_plataforma,
+        "plataformas_pendentes": plataformas_pendentes,
+        "passos_apify_fixos": len(plataformas_pendentes),
+        "linhas_coletadas": [],
+        "linhas_prontas": [],
+        "custo_total": 0.0,
+        "precisa_classificar": True,
+        "gerar_relatorio": gerar_relatorio,
+        "buscar_metricas_posts": st.session_state.buscar_metricas_posts,
+        "links_instagram_unicos": None,
+        "metricas_posts_ig": {},
+        "fila_saudabilidade": [],
+        "fila_saudabilidade_flat": None,
+        "saudabilidade_por_post": {},
+        "fila_lotes_classificacao": [],
+        "fila_chunks_analise": [],
+        "resumos_blocos": [],
+        "relatorio_final": "",
+        "contexto_estudo_texto": montar_contexto_estudo_texto(),
+        "tempos_passo": [],
+        "passos_concluidos": 0,
+        "total_passos": max(1, len(plataformas_pendentes)),
+        "erro_msg": None,
+    }
+    job["total_passos"] = max(
+        job["total_passos"],
+        len(plataformas_pendentes)
+        + (math.ceil(n_estimado / TAMANHO_LOTE_CLASSIFICACAO) if n_estimado else 0)
+        + (1 if st.session_state.buscar_metricas_posts and links_por_plataforma.get("instagram") else 0)
+        + (1 if st.session_state.buscar_metricas_posts and n_estimado else 0)
+        + (math.ceil(n_estimado / TAMANHO_CHUNK_ANALISE) + 1 if gerar_relatorio and n_estimado else 0),
+    )
+    return job
+
+
+def criar_job_pulsar(arquivo_pulsar, reclassificar: bool, gerar_relatorio: bool) -> dict:
+    job = {
+        "fonte": "pulsar",
+        "fase": "ler_pulsar",
+        "inicio": time.time(),
+        "pulsar_bytes": arquivo_pulsar.getvalue(),
+        "linhas_coletadas": [],
+        "linhas_prontas": [],
+        "custo_total": 0.0,
+        "precisa_classificar": reclassificar,
+        "gerar_relatorio": gerar_relatorio,
+        "buscar_metricas_posts": st.session_state.buscar_metricas_posts,
+        "links_instagram_unicos": None,
+        "metricas_posts_ig": {},
+        "fila_saudabilidade": [],
+        "fila_saudabilidade_flat": None,
+        "saudabilidade_por_post": {},
+        "fila_lotes_classificacao": [],
+        "fila_chunks_analise": [],
+        "resumos_blocos": [],
+        "relatorio_final": "",
+        "contexto_estudo_texto": montar_contexto_estudo_texto(),
+        "tempos_passo": [],
+        "passos_concluidos": 0,
+        "total_passos": 1,
+        "passos_apify_fixos": 0,
+        "erro_msg": None,
+    }
+    return job
+
+
+def processar_passo_job(job: dict):
+    """Executa exatamente UM passo (uma chamada de API) e avança a fase do job."""
+    fase = job["fase"]
+
+    if fase == "coleta_apify":
+        plataforma = job["plataformas_pendentes"].pop(0)
+        plinks = job["links_por_plataforma"][plataforma]
+        rows = []
+        if is_apify_configured():
+            try:
+                from apify_client import ApifyClient
+
+                client = ApifyClient(st.session_state.apify_token)
+                if plataforma == "instagram":
+                    run_input = {
+                        "directUrls": plinks,
+                        "resultsLimit": st.session_state.ig_limit,
+                        "includeNestedComments": False,
+                    }
+                    actor_id = ACTOR_INSTAGRAM
+                else:
+                    run_input = {
+                        "postURLs": plinks,
+                        "commentsPerPost": st.session_state.tk_limit,
+                        "topLevelCommentsPerPost": st.session_state.tk_limit,
+                        "maxRepliesPerComment": 0,
+                        "profiles": [],
+                        "resultsPerPage": 100,
+                        "profileScrapeSections": ["videos"],
+                        "profileSorting": "latest",
+                        "excludePinnedPosts": False,
+                    }
+                    actor_id = ACTOR_TIKTOK
+
+                run = client.actor(actor_id).call(run_input=run_input)
+                if isinstance(run, dict):
+                    dataset_id = run.get("defaultDatasetId")
+                else:
+                    dataset_id = getattr(run, "default_dataset_id", None) or getattr(run, "defaultDatasetId", None)
+                items = list(client.dataset(dataset_id).iterate_items())
+                for item in items:
+                    rows.append(
+                        {
+                            "post_link": item.get("postUrl") or item.get("videoUrl") or item.get("url", ""),
+                            "plataforma": plataforma,
+                            "autor": item.get("ownerUsername") or item.get("uniqueId") or item.get("author", ""),
+                            "comentario": item.get("text") or item.get("comment", ""),
+                            "data_extracao": datetime.now().isoformat(),
+                        }
+                    )
+                log(f"Apify ({plataforma}) retornou {len(rows)} comentários reais.")
+            except Exception as e:
+                job["erro_msg"] = f"Erro ao chamar Apify ({plataforma}): {e}"
+                log(job["erro_msg"])
+        else:
+            time.sleep(0.3)
+            exemplos = [
+                "Adorei esse conteúdo, muito útil!",
+                "Não gostei do produto, veio quebrado.",
+                "Achei ok, nada de mais.",
+                "Excelente atendimento, super recomendo!",
+                "Poderia ser melhor explicado.",
+                "Péssima experiência, não volto mais.",
+                "Simplesmente incrível, superou minhas expectativas!",
+                "Comentário neutro sobre o assunto.",
+            ]
+            for link in plinks:
+                for _ in range(random.randint(3, 6)):
+                    rows.append(
+                        {
+                            "post_link": link,
+                            "plataforma": plataforma,
+                            "autor": f"usuario_{random.randint(100,999)}",
+                            "comentario": random.choice(exemplos),
+                            "data_extracao": datetime.now().isoformat(),
+                        }
+                    )
+            log(f"[DEMO] {len(rows)} comentários fictícios gerados ({plataforma}).")
+
+        if rows:
+            job["linhas_coletadas"].extend(rows)
+            job["custo_total"] += registrar_gasto(plataforma, len(rows))
+
+        job["fase"] = "preparar_classificacao" if not job["plataformas_pendentes"] else "coleta_apify"
+        return
+
+    if fase == "ler_pulsar":
+        try:
+            df = ler_planilha_pulsar(io.BytesIO(job["pulsar_bytes"]))
+            log(f"Planilha do Pulsar lida: {len(df)} comentários.")
+            if job["precisa_classificar"]:
+                job["linhas_coletadas"] = df.drop(columns=["sentimento", "justificativa"]).to_dict("records")
+            else:
+                job["linhas_prontas"] = df.to_dict("records")
+                log("Usando a classificação de sentimento original do Pulsar.")
+        except Exception as e:
+            job["erro_msg"] = f"Erro ao ler a planilha do Pulsar: {e}"
+            log(job["erro_msg"])
+        job["fase"] = "preparar_classificacao"
+        return
+
+    if fase == "preparar_classificacao":
+        recomputar_total_passos(job)
+        if job["precisa_classificar"] and job["linhas_coletadas"]:
+            job["fila_lotes_classificacao"] = dividir_em_lotes(job["linhas_coletadas"], TAMANHO_LOTE_CLASSIFICACAO)
+            job["fase"] = "classificacao"
+        else:
+            job["fase"] = "preparar_metricas_ig"
+        return
+
+    if fase == "classificacao":
+        lote = job["fila_lotes_classificacao"].pop(0)
+        eh_apify = job["fonte"] == "apify"
+        if is_gemini_configured():
+            try:
+                import google.generativeai as genai
+
+                genai.configure(api_key=st.session_state.gemini_key)
+                model = genai.GenerativeModel(st.session_state.gemini_model)
+                if eh_apify:
+                    classificados = classificar_lote_gemini_apify(model, lote)
+                else:
+                    classificados = classificar_lote_gemini(model, lote)
+            except Exception as e:
+                job["erro_msg"] = f"Erro no Gemini ao classificar — aplicando fallback simulado ({e})."
+                log(job["erro_msg"])
+                classificados = classificar_lote_demo(lote, apify=eh_apify)
+        else:
+            classificados = classificar_lote_demo(lote, apify=eh_apify)
+        job["linhas_prontas"].extend(classificados)
+        if not job["fila_lotes_classificacao"]:
+            log(f"Classificação concluída: {len(job['linhas_prontas'])} comentários.")
+            job["fase"] = "preparar_metricas_ig"
+        return
+
+    if fase == "preparar_metricas_ig":
+        recomputar_total_passos(job)
+        if not job.get("buscar_metricas_posts"):
+            job["links_instagram_unicos"] = []
+            job["fase"] = "preparar_analise"
+            return
+        links_ig = sorted({
+            r.get("post_link", "") for r in job["linhas_prontas"]
+            if r.get("post_link") and "instagram.com" in str(r.get("post_link", "")).lower()
+        })
+        job["links_instagram_unicos"] = links_ig
+        job["fase"] = "metricas_ig" if links_ig else "preparar_saudabilidade"
+        return
+
+    if fase == "metricas_ig":
+        links_ig = job.get("links_instagram_unicos") or []
+        metricas = {}
+        if is_apify_configured():
+            try:
+                items = coletar_posts_ig(links_ig, results_type="posts", limit=1)
+                for item in items:
+                    if "shortCode" not in item:
+                        continue
+                    linha = normalizar_item_post(item)
+                    if linha["link"]:
+                        metricas[linha["link"]] = linha
+                if items:
+                    custo = registrar_gasto("instagram_posts", len(items))
+                    job["custo_total"] += custo
+                    log(
+                        f"Actor de posts/perfis IG retornou {len(items)} item(ns) para "
+                        f"{len(links_ig)} link(s) — custo: ${custo:.4f}."
+                    )
+                else:
+                    log("Actor de posts/perfis IG não retornou itens para esses links.")
+            except Exception as e:
+                log(f"Aviso: não foi possível buscar métricas dos posts do Instagram ({e}).")
+        else:
+            for item in DEMO_POSTS_SAMPLE:
+                linha = normalizar_item_post(item)
+                if linha["link"]:
+                    metricas[linha["link"]] = linha
+            log("[DEMO] Métricas fictícias de posts do Instagram usadas.")
+        job["metricas_posts_ig"] = metricas
+        job["fase"] = "preparar_saudabilidade"
+        return
+
+    if fase == "preparar_saudabilidade":
+        recomputar_total_passos(job)
+        info_por_post = []
+        if not job.get("buscar_metricas_posts"):
+            job["fila_saudabilidade"] = []
+            job["fila_saudabilidade_flat"] = []
+            job["fase"] = "preparar_analise"
+            return
+        df_tmp = pd.DataFrame(job["linhas_prontas"]) if job["linhas_prontas"] else pd.DataFrame()
+        if not df_tmp.empty and "sentimento" in df_tmp.columns and "post_link" in df_tmp.columns:
+            for post_link, grupo_post in df_tmp.groupby("post_link"):
+                total_post = len(grupo_post)
+                pos_pct = (grupo_post["sentimento"] == "Positivo").mean()
+                neg_pct = (grupo_post["sentimento"] == "Negativo").mean()
+                neu_pct = 1 - pos_pct - neg_pct
+                m = job["metricas_posts_ig"].get(post_link, {})
+                partes = []
+                for campo, rotulo in [
+                    ("likes_post", "curtidas"), ("comentarios_post", "comentários no post"),
+                    ("views_post", "views"), ("plays_post", "plays"),
+                ]:
+                    valor = m.get(campo)
+                    if valor is not None and not (isinstance(valor, float) and pd.isna(valor)):
+                        try:
+                            partes.append(f"{rotulo}: {int(valor)}")
+                        except (TypeError, ValueError):
+                            pass
+                info_por_post.append({
+                    "post_link": post_link,
+                    "resumo_sentimento": (
+                        f"Positivo {pos_pct:.0%}, Neutro {neu_pct:.0%}, Negativo {neg_pct:.0%} "
+                        f"(de {total_post} comentários)"
+                    ),
+                    "metricas_texto": ", ".join(partes) if partes else "Não disponível",
+                    "pos_pct": pos_pct,
+                    "neg_pct": neg_pct,
+                })
+        job["fila_saudabilidade_flat"] = info_por_post
+        job["fila_saudabilidade"] = dividir_em_lotes(info_por_post, TAMANHO_LOTE_SAUDABILIDADE)
+        job["fase"] = "saudabilidade" if job["fila_saudabilidade"] else "preparar_analise"
+        return
+
+    if fase == "saudabilidade":
+        lote_info = job["fila_saudabilidade"].pop(0)
+        if is_gemini_configured():
+            try:
+                import google.generativeai as genai
+
+                genai.configure(api_key=st.session_state.gemini_key)
+                model = genai.GenerativeModel(st.session_state.gemini_model)
+                resultado_lote = classificar_saudabilidade_lote_gemini(model, lote_info)
+            except Exception as e:
+                log(f"Erro no Gemini ao calcular saudabilidade — aplicando estimativa simples ({e}).")
+                resultado_lote = classificar_saudabilidade_lote_demo(lote_info)
+        else:
+            resultado_lote = classificar_saudabilidade_lote_demo(lote_info)
+        job["saudabilidade_por_post"].update(resultado_lote)
+        if not job["fila_saudabilidade"]:
+            log(f"Saudabilidade calculada para {len(job['saudabilidade_por_post'])} post(s).")
+            job["fase"] = "preparar_analise"
+        return
+
+    if fase == "preparar_analise":
+        recomputar_total_passos(job)
+        if job["gerar_relatorio"] and job["linhas_prontas"]:
+            comentarios = [r.get("comentario", "") for r in job["linhas_prontas"]]
+            job["fila_chunks_analise"] = dividir_em_lotes(comentarios, TAMANHO_CHUNK_ANALISE)
+            job["fase"] = "analise_blocos"
+        else:
+            job["fase"] = "concluido"
+        return
+
+    if fase == "analise_blocos":
+        bloco = job["fila_chunks_analise"].pop(0)
+        if is_gemini_configured():
+            try:
+                import google.generativeai as genai
+
+                genai.configure(api_key=st.session_state.gemini_key)
+                model = genai.GenerativeModel(st.session_state.gemini_model)
+                resumo = analisar_bloco_gemini(model, bloco, job["contexto_estudo_texto"])
+            except Exception as e:
+                resumo = f"[Bloco não pôde ser analisado pelo Gemini: {e}]"
+                log(f"Erro ao analisar bloco: {e}")
+        else:
+            contagem_local = pd.Series(bloco).apply(classificar_demo).value_counts()
+            resumo = "[DEMO] " + ", ".join(f"{k}: {v}" for k, v in contagem_local.items())
+        job["resumos_blocos"].append(resumo)
+        if not job["fila_chunks_analise"]:
+            job["fase"] = "sintese"
+        return
+
+    if fase == "sintese":
+        df_prontas = pd.DataFrame(job["linhas_prontas"])
+        if is_gemini_configured():
+            try:
+                import google.generativeai as genai
+
+                genai.configure(api_key=st.session_state.gemini_key)
+                model = genai.GenerativeModel(st.session_state.gemini_model)
+                job["relatorio_final"] = gerar_sintese_final(model, df_prontas, job["resumos_blocos"])
+                log("Relatório aprofundado gerado a partir dos blocos (Gemini).")
+            except Exception as e:
+                job["relatorio_final"] = f"Não foi possível gerar o relatório final: {e}"
+                log(f"Erro na síntese final: {e}")
+        else:
+            contagem = df_prontas["sentimento"].value_counts()
+            total = len(df_prontas)
+            resumo = "\n".join(
+                f"- {s}: {int(contagem.get(s,0))} ({contagem.get(s,0)/total:.0%})"
+                for s in ["Positivo", "Neutro", "Negativo"]
+            )
+            job["relatorio_final"] = (
+                f"# [DEMO] Análise aprofundada — {st.session_state.campanha or 'estudo sem nome'}\n\n"
+                f"## Panorama geral\n\n{resumo}\n\n"
+                "## Observação\n\nRelatório simulado — configure a Gemini API Key para gerar a "
+                "análise dissertativa completa a partir dos blocos processados."
+            )
+            log("[DEMO] Relatório-modelo gerado (Gemini não configurado).")
+        job["fase"] = "concluido"
+        return
 
 
 # ----------------------------------------------------------------------
@@ -607,22 +1298,20 @@ def buscar_permissao(email: str):
 
 
 # ----------------------------------------------------------------------
-# GESTÃO DOS PROMPTS (editáveis pelo admin, persistidos em disco/BQ)
+# GESTÃO DOS PROMPTS
 # ----------------------------------------------------------------------
 def carregar_prompts():
     if os.path.exists(PROMPTS_FILE):
         try:
             with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
                 dados = json.load(f)
-            st.session_state.prompt_sentimento = dados.get(
-                "prompt_sentimento", DEFAULT_PROMPT_SENTIMENTO
+            st.session_state.prompt_sentimento = dados.get("prompt_sentimento", DEFAULT_PROMPT_SENTIMENTO)
+            st.session_state.prompt_sentimento_apify = dados.get(
+                "prompt_sentimento_apify", DEFAULT_PROMPT_SENTIMENTO_APIFY
             )
-            st.session_state.prompt_relatorio = dados.get(
-                "prompt_relatorio", DEFAULT_PROMPT_RELATORIO
-            )
-            st.session_state.prompt_saudabilidade = dados.get(
-                "prompt_saudabilidade", DEFAULT_PROMPT_SAUDABILIDADE
-            )
+            st.session_state.prompt_analise_bloco = dados.get("prompt_analise_bloco", DEFAULT_PROMPT_ANALISE_BLOCO)
+            st.session_state.prompt_relatorio = dados.get("prompt_relatorio", DEFAULT_PROMPT_RELATORIO)
+            st.session_state.prompt_saudabilidade = dados.get("prompt_saudabilidade", DEFAULT_PROMPT_SAUDABILIDADE)
         except Exception:
             pass
 
@@ -634,6 +1323,8 @@ def salvar_prompts():
             json.dump(
                 {
                     "prompt_sentimento": st.session_state.prompt_sentimento,
+                    "prompt_sentimento_apify": st.session_state.prompt_sentimento_apify,
+                    "prompt_analise_bloco": st.session_state.prompt_analise_bloco,
                     "prompt_relatorio": st.session_state.prompt_relatorio,
                     "prompt_saudabilidade": st.session_state.prompt_saudabilidade,
                 },
@@ -718,34 +1409,12 @@ with st.sidebar:
     )
 
 # ----------------------------------------------------------------------
-# CABEÇALHO / STEPPER
+# CABEÇALHO
 # ----------------------------------------------------------------------
 st.title("🤖 Painel de Análise de Sentimentos em Comentários")
-st.caption("SIC (Reels/TikTok) + Campanhas BR → Apify → Gemini (automático) → Relatório → Exportar")
+st.caption("Escolha a fonte, preencha o contexto e rode tudo com um clique.")
 
-cols = st.columns(len(STAGES))
-for i, (col, stage) in enumerate(zip(cols, STAGES)):
-    active = i <= st.session_state.current_stage
-    bg = stage["color"] if active else "#F3F4F6"
-    text_color = "#111827" if active else "#9CA3AF"
-    col.markdown(
-        f"""<div style="background-color:{bg};color:{text_color};border-radius:10px;
-        padding:10px 6px;text-align:center;font-size:12px;font-weight:600;
-        border:1px solid #d1d5db;min-height:55px;display:flex;align-items:center;
-        justify-content:center;">{stage['label']}</div>""",
-        unsafe_allow_html=True,
-    )
-st.write("")
-
-tab_labels = [
-    "1️⃣ Links + contexto",
-    "2️⃣ Coletar e analisar",
-    "📸 Posts & Perfis (IG)",
-    "3️⃣ Sentimentalização",
-    "4️⃣ Relatório aprofundado",
-    "5️⃣ Salvar / Exportar",
-    "💰 Gastos",
-]
+tab_labels = ["🚀 Análise", "📸 Posts & Perfis (IG)", "💰 Gastos"]
 if st.session_state.pode_configurar:
     tab_labels.append("⚙️ Configurações")
 tab_labels.append("🪵 Log")
@@ -754,326 +1423,499 @@ tab_objects = st.tabs(tab_labels)
 tabs = dict(zip(tab_labels, tab_objects))
 
 # ----------------------------------------------------------------------
-# 1) LINKS + CONTEXTO (origem, campanha, marca, briefing, diretrizes)
+# 🚀 ANÁLISE — tela única
 # ----------------------------------------------------------------------
-with tabs["1️⃣ Links + contexto"]:
-    st.subheader("Links e contexto da coleta")
-    st.caption(
-        "Cada rodada é um lote: cole os links dessa campanha/conteúdo e preencha o "
-        "contexto — isso é usado tanto para a coleta quanto para enriquecer a "
-        "sentimentalização no Gemini."
-    )
+with tabs["🚀 Análise"]:
+    _job_em_andamento = st.session_state.job is not None and st.session_state.job["fase"] not in ("concluido", "cancelado")
 
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        st.session_state.origem = st.selectbox(
-            "Origem", ORIGENS, index=ORIGENS.index(st.session_state.origem)
-        )
-    with c2:
-        st.session_state.links_input = st.text_area(
-            "Links — um por linha (Instagram e/ou TikTok, detectado automaticamente)",
-            value=st.session_state.links_input,
-            height=140,
-            placeholder=(
-                "https://www.instagram.com/reel/exemplo1/\n"
-                "https://www.tiktok.com/@usuario/video/1234567890"
-            ),
-        )
+    if _job_em_andamento:
+        st.info("⏳ Um processamento já está em andamento — os campos abaixo ficam bloqueados até terminar ou você cancelar.")
 
-    st.markdown("##### Contexto (usado no prompt do Gemini e nas exportações)")
-    c1, c2, c3, c4 = st.columns(4)
-    st.session_state.campanha = c1.text_input("Campanha", value=st.session_state.campanha)
-    st.session_state.marca = c2.text_input("Marca (brand)", value=st.session_state.marca)
-    st.session_state.mother_brand = c3.text_input("Mother brand", value=st.session_state.mother_brand)
-    st.session_state.nucleo = c4.text_input(
-        "Núcleo (ex: Beauty, Alimentos...)", value=st.session_state.nucleo
-    )
+    st.session_state.fonte = st.radio("Fonte dos dados", FONTES, horizontal=True, disabled=_job_em_andamento)
 
-    st.session_state.briefing = st.text_area(
-        "Briefing do conteúdo (do que se trata esse post — dá mais contexto pra IA)",
-        value=st.session_state.briefing,
-        height=90,
-        placeholder="Ex: Reels de lançamento do produto X, tom bem-humorado, foco em público jovem...",
-    )
-    st.session_state.diretrizes_marca = st.text_area(
-        "Diretrizes da marca para a sentimentalização (critérios específicos desse cliente)",
-        value=st.session_state.diretrizes_marca,
-        height=90,
-        placeholder="Ex: comentários pedindo suporte técnico devem contar como Neutro, não Negativo...",
-    )
-
-    if st.button("Confirmar links", type="primary"):
-        links = [l.strip() for l in st.session_state.links_input.splitlines() if l.strip()]
-        if not links:
-            st.warning("Cole ao menos um link.")
-        else:
-            st.session_state.links_list = links
-            log(f"{len(links)} link(s) confirmado(s) — origem: {st.session_state.origem}.")
-            st.success(f"{len(links)} link(s) confirmado(s). Vá para a aba 'Coletar e analisar'.")
-
-    if st.session_state.links_list:
-        df_links = pd.DataFrame({"link": st.session_state.links_list})
-        df_links["plataforma"] = df_links["link"].apply(detectar_plataforma)
-        st.dataframe(df_links, use_container_width=True)
-        esperado = "instagram" if "Reels" in st.session_state.origem else (
-            "tiktok" if "TikTok" in st.session_state.origem else None
-        )
-        if esperado and (df_links["plataforma"] != esperado).any():
-            st.warning(
-                f"A origem selecionada é '{st.session_state.origem}', mas nem todos os "
-                f"links parecem ser do {esperado}. Confira antes de coletar."
+    arquivo_pulsar = None
+    if st.session_state.fonte == FONTES[0]:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.session_state.origem = st.selectbox("Origem", ORIGENS_APIFY)
+        with c2:
+            st.session_state.links_input = st.text_area(
+                "Links — um por linha (Instagram e/ou TikTok, detectado automaticamente)",
+                value=st.session_state.links_input,
+                height=120,
+                placeholder=(
+                    "https://www.instagram.com/reel/exemplo1/\n"
+                    "https://www.tiktok.com/@usuario/video/1234567890"
+                ),
             )
 
-# ----------------------------------------------------------------------
-# 2) COLETAR E ANALISAR (Apify + Gemini automático, num único botão)
-# ----------------------------------------------------------------------
-with tabs["2️⃣ Coletar e analisar"]:
-    st.subheader("Coleta automática de comentários + sentimentalização")
-    if not st.session_state.links_list:
-        st.info("Confirme os links na aba anterior primeiro.")
+        st.markdown("##### Contexto (usado no prompt do Gemini e nas exportações)")
+        c1, c2, c3, c4 = st.columns(4)
+        st.session_state.campanha = c1.text_input("Campanha", value=st.session_state.campanha)
+        st.session_state.marca = c2.text_input("Marca (brand)", value=st.session_state.marca)
+        st.session_state.mother_brand = c3.text_input("Mother brand", value=st.session_state.mother_brand)
+        st.session_state.nucleo = c4.text_input("Núcleo (ex: Beauty, Alimentos...)", value=st.session_state.nucleo)
+        st.session_state.briefing = st.text_area(
+            "Briefing do conteúdo (do que se trata — dá mais contexto pra IA)",
+            value=st.session_state.briefing, height=80,
+        )
+        st.session_state.diretrizes_marca = st.text_area(
+            "Diretrizes da marca para a sentimentalização (critérios específicos desse cliente)",
+            value=st.session_state.diretrizes_marca, height=80,
+        )
+
     else:
-        links_por_plataforma = {"instagram": [], "tiktok": [], "desconhecido": []}
-        for l in st.session_state.links_list:
-            links_por_plataforma[detectar_plataforma(l)].append(l)
-
-        st.session_state.buscar_metricas_posts = st.checkbox(
-            "📊 Também buscar métricas dos posts do Instagram (curtidas, comentários, views)",
-            value=st.session_state.buscar_metricas_posts,
-            help=(
-                "Usa o Actor de Posts/Perfis do Instagram para complementar cada post com "
-                "números — é uma chamada de Apify separada da coleta de comentários, então "
-                "soma custo/tempo extra. Disponível só para links do Instagram (o Instagram "
-                "não expõe compartilhamentos via scraping)."
-            ),
+        st.session_state.origem = "Pulsar"
+        arquivo_pulsar = st.file_uploader(
+            "Planilha exportada do Pulsar (.xlsx, aba 'Contents')", type=["xlsx"]
+        )
+        st.session_state.reclassificar_pulsar_gemini = st.checkbox(
+            "Reclassificar sentimento com Gemini em vez de usar o do Pulsar "
+            "(mais lento e mais caro para planilhas grandes)",
+            value=st.session_state.reclassificar_pulsar_gemini,
         )
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Links Instagram", len(links_por_plataforma["instagram"]))
-        c2.metric("Links TikTok", len(links_por_plataforma["tiktok"]))
-        custo_estimado = (
-            (len(links_por_plataforma["instagram"]) * st.session_state.ig_limit / 1000) * RATE_PER_1000["instagram"]
-            + (len(links_por_plataforma["tiktok"]) * st.session_state.tk_limit / 1000) * RATE_PER_1000["tiktok"]
+        st.markdown("##### Contexto do estudo (usado no prompt do Gemini)")
+        c1, c2 = st.columns([2, 1])
+        st.session_state.estudo_nome = c1.text_input("Nome do estudo", value=st.session_state.estudo_nome)
+        st.session_state.nucleo = c2.text_input("Núcleo (ex: Beauty, Alimentos...)", value=st.session_state.nucleo)
+        st.session_state.estudo_objetivo = st.text_area(
+            "Objetivo do estudo (o que vocês querem entender com essa análise)",
+            value=st.session_state.estudo_objetivo, height=70,
         )
-        if st.session_state.buscar_metricas_posts:
-            # 1 chamada ao Actor de posts por link do Instagram (resultsLimit=1 cada)
-            custo_estimado += (
-                len(links_por_plataforma["instagram"]) / 1000
-            ) * RATE_PER_1000["instagram_posts"]
-        c3.metric("Custo máx. estimado", f"${custo_estimado:.2f}")
+        st.session_state.tipo_estudo = st.radio(
+            "Este estudo é sobre...", TIPOS_ESTUDO, horizontal=True,
+            index=TIPOS_ESTUDO.index(st.session_state.tipo_estudo),
+        )
 
-        if not is_apify_configured():
-            st.warning("Apify não configurado — vai gerar comentários de demonstração.")
-        if not is_gemini_configured():
-            st.warning("Gemini não configurado — sentimento vai ser classificado por simulação (demo).")
-
-        if st.button("🚀 Coletar e analisar automaticamente", type="primary"):
-            todos_rows = []
-            custo_total_execucao = 0.0
-
-            for plataforma in ("instagram", "tiktok"):
-                links = links_por_plataforma[plataforma]
-                if not links:
-                    continue
-                with st.spinner(f"Coletando comentários — {plataforma}..."):
-                    rows = []
-                    if is_apify_configured():
-                        try:
-                            from apify_client import ApifyClient
-
-                            client = ApifyClient(st.session_state.apify_token)
-                            if plataforma == "instagram":
-                                run_input = {
-                                    "directUrls": links,
-                                    "resultsLimit": st.session_state.ig_limit,
-                                    "includeNestedComments": None,
-                                }
-                                actor_id = ACTOR_INSTAGRAM
-                            else:
-                                run_input = {
-                                    "postURLs": links,
-                                    "commentsPerPost": st.session_state.tk_limit,
-                                    "topLevelCommentsPerPost": None,
-                                    "maxRepliesPerComment": 0,
-                                    "profiles": None,
-                                    "resultsPerPage": 100,
-                                    "profileScrapeSections": ["videos"],
-                                    "profileSorting": "latest",
-                                    "oldestPostDateUnified": None,
-                                    "newestPostDate": None,
-                                    "excludePinnedPosts": False,
-                                }
-                                actor_id = ACTOR_TIKTOK
-
-                            run = client.actor(actor_id).call(run_input=run_input)
-                            items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
-                            for item in items:
-                                rows.append(
-                                    {
-                                        "post_link": item.get("postUrl") or item.get("videoUrl") or item.get("url", ""),
-                                        "plataforma": plataforma,
-                                        "autor": item.get("ownerUsername") or item.get("uniqueId") or item.get("author", ""),
-                                        "comentario": item.get("text") or item.get("comment", ""),
-                                        "data_extracao": datetime.now().isoformat(),
-                                    }
-                                )
-                            log(f"Apify ({plataforma}) retornou {len(rows)} comentários reais.")
-                        except Exception as e:
-                            st.error(f"Erro ao chamar Apify ({plataforma}): {e}")
+        st.markdown("###### Marcas envolvidas (opcional)")
+        st.caption(
+            "Preencha se o estudo girar em torno de marca(s) — própria(s) e/ou concorrente(s), "
+            "o que cada uma faz, e os produtos específicos (adicione quantos precisar). Deixe o "
+            "nome em branco se o estudo não tiver marca no centro."
+        )
+        for i, m in enumerate(st.session_state.marcas_estudo):
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([2, 1, 0.4])
+                m["nome"] = c1.text_input("Nome da marca", value=m["nome"], key=f"marca_nome_{i}")
+                m["tipo"] = c2.selectbox(
+                    "Tipo", TIPOS_MARCA, index=TIPOS_MARCA.index(m["tipo"]), key=f"marca_tipo_{i}"
+                )
+                if c3.button("🗑️", key=f"marca_remover_{i}", help="Remover marca"):
+                    if len(st.session_state.marcas_estudo) > 1:
+                        st.session_state.marcas_estudo.pop(i)
+                        st.rerun()
                     else:
-                        time.sleep(0.5)
-                        exemplos = [
-                            "Adorei esse conteúdo, muito útil!",
-                            "Não gostei do produto, veio quebrado.",
-                            "Achei ok, nada de mais.",
-                            "Excelente atendimento, super recomendo!",
-                            "Poderia ser melhor explicado.",
-                            "Péssima experiência, não volto mais.",
-                            "Simplesmente incrível, superou minhas expectativas!",
-                            "Comentário neutro sobre o assunto.",
-                            "Alguém sabe se ainda tem em estoque?",
-                        ]
-                        for link in links:
-                            for _ in range(random.randint(3, 6)):
-                                rows.append(
-                                    {
-                                        "post_link": link,
-                                        "plataforma": plataforma,
-                                        "autor": f"usuario_{random.randint(100,999)}",
-                                        "comentario": random.choice(exemplos),
-                                        "data_extracao": datetime.now().isoformat(),
-                                    }
-                                )
-                        log(f"[DEMO] {len(rows)} comentários fictícios gerados ({plataforma}).")
-
-                    if rows:
-                        todos_rows.extend(rows)
-                        custo = registrar_gasto(plataforma, len(rows))
-                        custo_total_execucao += custo
-
-            if not todos_rows:
-                st.warning("Nenhum comentário coletado.")
-            else:
-                df = pd.DataFrame(todos_rows)
-                st.session_state.comentarios_df = df
-                st.session_state.current_stage = max(st.session_state.current_stage, 1)
-                log(f"Coleta finalizada: {len(df)} comentários. Custo: ${custo_total_execucao:.2f}.")
-
-                metricas_posts_ig = {}
-                if st.session_state.buscar_metricas_posts and links_por_plataforma["instagram"]:
-                    with st.spinner("Buscando métricas dos posts do Instagram (curtidas, comentários, views)..."):
-                        metricas_posts_ig = buscar_metricas_posts_ig(links_por_plataforma["instagram"])
-                        if metricas_posts_ig:
-                            log(f"Métricas obtidas para {len(metricas_posts_ig)} post(s)/reel(s) do Instagram.")
-                        else:
-                            log("Aviso: nenhuma métrica de post do Instagram foi retornada.")
-
-                with st.spinner("Rodando sentimentalização automática no Gemini..."):
-                    resultados = df.copy()
-                    if is_gemini_configured():
-                        try:
-                            import google.generativeai as genai
-
-                            genai.configure(api_key=st.session_state.gemini_key)
-                            model = genai.GenerativeModel(st.session_state.gemini_model)
-                            sentimentos, justificativas = [], []
-                            progress = st.progress(0)
-                            for i, comentario in enumerate(resultados["comentario"]):
-                                prompt = montar_prompt_sentimento(comentario)
-                                resp = model.generate_content(prompt)
-                                try:
-                                    parsed = json.loads(resp.text.strip().strip("```json").strip("```"))
-                                    sentimentos.append(parsed.get("sentimento", "Neutro"))
-                                    justificativas.append(parsed.get("justificativa", ""))
-                                except Exception:
-                                    sentimentos.append("Neutro")
-                                    justificativas.append(resp.text[:120])
-                                progress.progress((i + 1) / len(resultados))
-                            resultados["sentimento"] = sentimentos
-                            resultados["justificativa"] = justificativas
-                            log(f"Gemini analisou {len(resultados)} comentários automaticamente.")
-                        except Exception as e:
-                            st.error(f"Erro ao chamar Gemini: {e}")
-                    else:
-                        time.sleep(0.8)
-                        resultados["sentimento"] = resultados["comentario"].apply(classificar_demo)
-                        resultados["justificativa"] = "[DEMO] classificação simulada por palavras-chave"
-                        log(f"[DEMO] {len(resultados)} comentários classificados (simulado).")
-
-                    # Metadados do lote (SIC/BR, campanha, marca, mother brand, núcleo)
-                    resultados["origem"] = st.session_state.origem
-                    resultados["campanha"] = st.session_state.campanha
-                    resultados["marca"] = st.session_state.marca
-                    resultados["mother_brand"] = st.session_state.mother_brand
-                    resultados["nucleo"] = st.session_state.nucleo
-
-                    # Enriquecimento com métricas do post (curtidas, comentários, views...)
-                    if metricas_posts_ig:
-                        campos_extra = [
-                            "likes_post", "comentarios_post", "views_post", "plays_post",
-                            "compartilhamentos_post", "tipo_midia", "is_reel",
-                            "duracao_video_seg", "data_publicacao_post",
-                        ]
-                        for campo in campos_extra:
-                            resultados[campo] = resultados["post_link"].map(
-                                lambda l: metricas_posts_ig.get(l, {}).get(campo)
-                            )
-
-                with st.spinner("Calculando saudabilidade de cada post..."):
-                    saudabilidade_map = {}
-                    for post_link, grupo_post in resultados.groupby("post_link"):
-                        total_post = len(grupo_post)
-                        pos_pct = (grupo_post["sentimento"] == "Positivo").mean()
-                        neg_pct = (grupo_post["sentimento"] == "Negativo").mean()
-                        neu_pct = 1 - pos_pct - neg_pct
-
-                        partes_metricas = []
-                        if "likes_post" in grupo_post.columns:
-                            m = grupo_post.iloc[0]
-                            for campo, rotulo in [
-                                ("likes_post", "curtidas"),
-                                ("comentarios_post", "comentários no post"),
-                                ("views_post", "views"),
-                                ("plays_post", "plays"),
-                            ]:
-                                valor = m.get(campo)
-                                if pd.notna(valor):
-                                    partes_metricas.append(f"{rotulo}: {int(valor)}")
-                        metricas_texto = ", ".join(partes_metricas) if partes_metricas else "Não disponível"
-
-                        saudabilidade_map[post_link] = gerar_saudabilidade_post(
-                            pos_pct, neu_pct, neg_pct, metricas_texto, total_post
-                        )
-
-                    for campo in ("saudabilidade_score", "saudabilidade_classificacao", "saudabilidade_resumo"):
-                        resultados[campo] = resultados["post_link"].map(
-                            lambda l: saudabilidade_map.get(l, {}).get(campo)
-                        )
-                    log(f"Saudabilidade calculada para {len(saudabilidade_map)} post(s).")
-
-                    st.session_state.resultados_df = resultados
-                    st.session_state.current_stage = max(st.session_state.current_stage, 3)
-
-                st.success(
-                    f"{len(df)} comentários coletados e classificados automaticamente. "
-                    f"Custo da coleta: **${custo_total_execucao:.2f}**."
+                        st.warning("Deixe pelo menos uma marca.")
+                m["o_que_faz"] = st.text_area(
+                    "O que essa marca faz / segmento de atuação",
+                    value=m["o_que_faz"], height=60, key=f"marca_faz_{i}",
                 )
 
-    if st.session_state.resultados_df is not None:
-        st.dataframe(st.session_state.resultados_df, use_container_width=True)
-    elif st.session_state.comentarios_df is not None:
-        st.dataframe(st.session_state.comentarios_df, use_container_width=True)
+                st.caption("Produtos dessa marca")
+                for pi, produto in enumerate(m["produtos"]):
+                    pc1, pc2 = st.columns([5, 0.4])
+                    m["produtos"][pi] = pc1.text_input(
+                        f"Produto {pi+1}", value=produto, key=f"produto_{i}_{pi}", label_visibility="collapsed",
+                        placeholder=f"Produto {pi+1}",
+                    )
+                    if pc2.button("🗑️", key=f"produto_remover_{i}_{pi}", help="Remover produto"):
+                        if len(m["produtos"]) > 1:
+                            m["produtos"].pop(pi)
+                        else:
+                            m["produtos"][0] = ""
+                        st.rerun()
+                if st.button("➕ Adicionar produto", key=f"add_produto_{i}"):
+                    m["produtos"].append("")
+                    st.rerun()
+
+        if st.button("➕ Adicionar marca"):
+            st.session_state.marcas_estudo.append(nova_marca())
+            st.rerun()
+
+        st.markdown("###### Temas, comportamentos ou tendências em estudo (opcional)")
+        st.caption(
+            "Pra estudos que não giram em torno de marca — um ato, ação, produto genérico, "
+            "comportamento, verbo, tendência, alimento, costume, cultura etc. Adicione quantos "
+            "temas precisar."
+        )
+        for i, t in enumerate(st.session_state.temas_estudo):
+            with st.container(border=True):
+                c1, c2 = st.columns([2, 0.4])
+                t["nome"] = c1.text_input(
+                    "Tema / comportamento / tendência", value=t["nome"], key=f"tema_nome_{i}",
+                    placeholder="Ex: veganismo, gírias da geração Z, romantizar a rotina...",
+                )
+                if c2.button("🗑️", key=f"tema_remover_{i}", help="Remover tema"):
+                    if len(st.session_state.temas_estudo) > 1:
+                        st.session_state.temas_estudo.pop(i)
+                        st.rerun()
+                    else:
+                        st.session_state.temas_estudo[0] = novo_tema()
+                        st.rerun()
+                t["descricao"] = st.text_area(
+                    "Descrição (contexto adicional sobre esse tema, opcional)",
+                    value=t["descricao"], height=60, key=f"tema_desc_{i}",
+                )
+        if st.button("➕ Adicionar tema"):
+            st.session_state.temas_estudo.append(novo_tema())
+            st.rerun()
+
+        st.session_state.diretrizes_extra = st.text_area(
+            "Observações adicionais para a IA (opcional)",
+            value=st.session_state.diretrizes_extra, height=70,
+        )
+
+    st.session_state.gerar_relatorio_auto = st.checkbox(
+        "Gerar também a análise aprofundada (relatório dissertativo, lido em blocos e depois "
+        "sintetizado — mais fiel aos comentários do que um resumo com amostra pequena)",
+        value=st.session_state.gerar_relatorio_auto,
+    )
+    st.session_state.buscar_metricas_posts = st.checkbox(
+        "📊 Buscar métricas dos posts do Instagram (curtidas, comentários, views) e calcular a "
+        "'saudabilidade' de cada post com o Gemini",
+        value=st.session_state.buscar_metricas_posts,
+        help=(
+            "As métricas usam o Actor de Posts/Perfis do Instagram (`" + ACTOR_INSTAGRAM_POSTS + "`) — "
+            f"1 chamada extra, cobrada à parte a ${RATE_PER_1000['instagram_posts']:.2f} por mil itens. "
+            "Só funciona para links do Instagram (o Instagram não expõe compartilhamentos via "
+            "scraping). A saudabilidade roda para todos os posts (Instagram e TikTok), usando o "
+            "sentimento + as métricas quando disponíveis."
+        ),
+    )
+
+    if not is_apify_configured() and st.session_state.fonte == FONTES[0]:
+        st.warning("Apify não configurado — vai gerar comentários de demonstração.")
+    if not is_gemini_configured():
+        st.warning("Gemini não configurado — sentimento/relatório serão simulados (modo demonstração).")
+
+    job_ativo = st.session_state.job is not None and st.session_state.job["fase"] not in ("concluido", "cancelado")
+
+    # ---------------- ETA prévio (antes de clicar em rodar) ----------------
+    if not job_ativo:
+        if st.session_state.fonte == FONTES[0]:
+            links_previa = [l.strip() for l in st.session_state.links_input.splitlines() if l.strip()]
+            n_ig = sum(1 for l in links_previa if detectar_plataforma(l) == "instagram")
+            n_tk = sum(1 for l in links_previa if detectar_plataforma(l) == "tiktok")
+            n_estimado = n_ig * st.session_state.ig_limit + n_tk * st.session_state.tk_limit
+            n_plataformas = (1 if n_ig else 0) + (1 if n_tk else 0)
+        else:
+            n_estimado = 2000 if arquivo_pulsar is not None else 0  # placeholder até ler o arquivo de verdade
+            n_plataformas = 0
+
+        if n_estimado or n_plataformas:
+            precisa_classificar = (
+                True if st.session_state.fonte == FONTES[0] else st.session_state.reclassificar_pulsar_gemini
+            )
+            eta = estimar_segundos(
+                n_estimado, n_plataformas, precisa_classificar, st.session_state.gerar_relatorio_auto,
+                st.session_state.buscar_metricas_posts,
+            )
+            legenda_eta = f"⏱️ Tempo estimado: ~{formatar_duracao(eta)} (estimativa aproximada, atualizada durante a execução)."
+            if st.session_state.fonte == FONTES[0] and st.session_state.buscar_metricas_posts and n_ig:
+                custo_metricas_estimado = (n_ig / 1000) * RATE_PER_1000["instagram_posts"]
+                legenda_eta += f" Custo extra estimado das métricas do Instagram: ~${custo_metricas_estimado:.2f}."
+            st.caption(legenda_eta)
+
+        rodar = st.button("🚀 Rodar análise completa", type="primary", use_container_width=True)
+
+        if rodar:
+            if st.session_state.fonte == FONTES[1]:
+                mapear_contexto_pulsar()
+                if arquivo_pulsar is None:
+                    st.warning("Envie a planilha do Pulsar antes de rodar.")
+                else:
+                    st.session_state.job = criar_job_pulsar(
+                        arquivo_pulsar, st.session_state.reclassificar_pulsar_gemini, st.session_state.gerar_relatorio_auto
+                    )
+                    st.session_state.resultados_df = None
+                    st.session_state.relatorio_texto = ""
+                    st.rerun()
+            else:
+                links = [l.strip() for l in st.session_state.links_input.splitlines() if l.strip()]
+                if not links:
+                    st.warning("Cole ao menos um link antes de rodar.")
+                else:
+                    links_por_plataforma = {"instagram": [], "tiktok": [], "desconhecido": []}
+                    for l in links:
+                        links_por_plataforma[detectar_plataforma(l)].append(l)
+                    st.session_state.job = criar_job_apify(links_por_plataforma, st.session_state.gerar_relatorio_auto)
+                    st.session_state.resultados_df = None
+                    st.session_state.relatorio_texto = ""
+                    st.rerun()
+
+    # ---------------- JOB EM ANDAMENTO: progresso + ETA + cancelar ----------------
+    if job_ativo:
+        job = st.session_state.job
+        st.divider()
+
+        rotulos_fase = {
+            "coleta_apify": "Coletando comentários (Apify)",
+            "ler_pulsar": "Lendo a planilha do Pulsar",
+            "preparar_classificacao": "Preparando classificação",
+            "classificacao": "Classificando sentimento (Gemini, em lotes)",
+            "preparar_metricas_ig": "Preparando busca de métricas dos posts (Instagram)",
+            "metricas_ig": "Buscando métricas dos posts no Instagram (curtidas, comentários, views)",
+            "preparar_saudabilidade": "Preparando cálculo de saudabilidade",
+            "saudabilidade": "Calculando a saudabilidade de cada post (Gemini)",
+            "preparar_analise": "Preparando análise aprofundada",
+            "analise_blocos": "Analisando comentários em blocos (Gemini)",
+            "sintese": "Sintetizando o relatório final",
+        }
+        st.info(f"⏳ {rotulos_fase.get(job['fase'], job['fase'])}...")
+
+        fracao = min(job["passos_concluidos"] / max(job["total_passos"], 1), 0.99)
+        st.progress(fracao, text=f"Passo {job['passos_concluidos']} de ~{job['total_passos']}")
+
+        if job["tempos_passo"]:
+            media = sum(job["tempos_passo"]) / len(job["tempos_passo"])
+            restantes = max(job["total_passos"] - job["passos_concluidos"], 0)
+            st.caption(f"⏱️ Tempo estimado restante: ~{formatar_duracao(media * restantes)}")
+
+        if job.get("erro_msg"):
+            st.warning(job["erro_msg"])
+
+        cancelar = st.button("🛑 Cancelar processamento")
+        if cancelar:
+            job["fase"] = "cancelado"
+            log("Processamento cancelado pelo usuário.")
+            st.session_state.job = job
+            st.rerun()
+        else:
+            t0 = time.time()
+            processar_passo_job(job)
+            job["tempos_passo"].append(time.time() - t0)
+            job["passos_concluidos"] += 1
+            st.session_state.job = job
+            time.sleep(0.05)
+            st.rerun()
+
+    # ---------------- JOB CONCLUÍDO: monta resultados_df/relatorio a partir do job ----------------
+    if st.session_state.job is not None and st.session_state.job["fase"] == "concluido":
+        job = st.session_state.job
+        linhas = job["linhas_prontas"]
+        if linhas:
+            resultados = pd.DataFrame(linhas)
+            resultados["origem"] = st.session_state.origem
+            resultados["campanha"] = st.session_state.campanha
+            resultados["marca"] = st.session_state.marca
+            resultados["mother_brand"] = st.session_state.mother_brand
+            resultados["nucleo"] = st.session_state.nucleo
+
+            metricas = job.get("metricas_posts_ig") or {}
+            if metricas:
+                campos_extra = [
+                    "likes_post", "comentarios_post", "views_post", "plays_post",
+                    "compartilhamentos_post", "tipo_midia", "is_reel",
+                    "duracao_video_seg", "data_publicacao_post",
+                ]
+                for campo in campos_extra:
+                    resultados[campo] = resultados["post_link"].map(
+                        lambda l: metricas.get(l, {}).get(campo)
+                    )
+
+            saudabilidade = job.get("saudabilidade_por_post") or {}
+            if saudabilidade:
+                for campo in ("saudabilidade_score", "saudabilidade_classificacao", "saudabilidade_resumo"):
+                    resultados[campo] = resultados["post_link"].map(
+                        lambda l: saudabilidade.get(l, {}).get(campo)
+                    )
+
+            st.session_state.resultados_df = resultados
+            st.session_state.relatorio_texto = job["relatorio_final"]
+            msg = (
+                f"Pronto! {len(resultados)} comentários processados em "
+                f"{formatar_duracao(time.time() - job['inicio'])}."
+            )
+            if job["custo_total"]:
+                msg += f" Custo total (coleta + métricas): **${job['custo_total']:.2f}** (registrado em 💰 Gastos)."
+            st.success(msg)
+        else:
+            st.warning("Nenhum comentário processado.")
+        st.session_state.job = None
+
+    if st.session_state.job is not None and st.session_state.job["fase"] == "cancelado":
+        st.warning("Processamento cancelado. Nenhum resultado foi salvo desta execução.")
+        st.session_state.job = None
+
+    # ---------------- RESULTADOS (aparecem assim que existirem) ----------------
+    resultados = st.session_state.resultados_df
+    if resultados is not None and not resultados.empty:
+        st.divider()
+        st.subheader("Resultado")
+
+        total = len(resultados)
+        pos = int(resultados["sentimento"].eq("Positivo").sum())
+        neg = int(resultados["sentimento"].eq("Negativo").sum())
+        neu = total - pos - neg
+        c1, c2, c3 = st.columns(3)
+        c1.metric("😊 Positivos", pos, f"{pos/total:.0%}")
+        c2.metric("😐 Neutros", neu, f"{neu/total:.0%}")
+        c3.metric("☹️ Negativos", neg, f"{neg/total:.0%}")
+
+        contagem = resultados["sentimento"].value_counts().reset_index()
+        contagem.columns = ["sentimento", "quantidade"]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(
+                px.pie(contagem, names="sentimento", values="quantidade", color="sentimento",
+                       color_discrete_map=SENTIMENT_COLORS, title="Distribuição de sentimentos"),
+                use_container_width=True,
+            )
+        with c2:
+            por_plataforma = resultados.groupby(["plataforma", "sentimento"]).size().reset_index(name="quantidade")
+            fig = px.bar(por_plataforma, x="plataforma", y="quantidade", color="sentimento",
+                         color_discrete_map=SENTIMENT_COLORS, title="Sentimento por plataforma", barmode="stack")
+            st.plotly_chart(fig, use_container_width=True)
+
+        tem_alvo = "alvo" in resultados.columns
+        if tem_alvo:
+            st.markdown("##### 🎯 Análise por alvo (apenas Apify)")
+            st.caption(
+                "Sobre o que os comentários falam — conteúdo, marca, produto/serviço ou preço. "
+                "Os percentuais consideram só Positivo + Negativo por alvo (Neutros não entram na contagem)."
+            )
+            avaliaveis = resultados[resultados["sentimento"].isin(["Positivo", "Negativo"])]
+            linhas_alvo = []
+            for alvo_nome, grupo in avaliaveis.groupby("alvo"):
+                p = int(grupo["sentimento"].eq("Positivo").sum())
+                n = int(grupo["sentimento"].eq("Negativo").sum())
+                base = p + n
+                linhas_alvo.append({
+                    "alvo": alvo_nome, "positivos": p, "negativos": n,
+                    "% positivo": f"{p/base:.0%}" if base else "-",
+                    "% negativo": f"{n/base:.0%}" if base else "-",
+                    "neutros (fora da contagem)": int((resultados["alvo"] == alvo_nome).sum() - base),
+                })
+            st.dataframe(pd.DataFrame(linhas_alvo), use_container_width=True)
+
+            fig_alvo = px.bar(
+                resultados.groupby(["alvo", "sentimento"]).size().reset_index(name="quantidade"),
+                x="alvo", y="quantidade", color="sentimento", color_discrete_map=SENTIMENT_COLORS,
+                title="Sentimento por alvo", barmode="stack",
+            )
+            st.plotly_chart(fig_alvo, use_container_width=True)
+
+        if "saudabilidade_score" in resultados.columns or "likes_post" in resultados.columns:
+            st.markdown("##### 📊 Resumo por post (métricas + saudabilidade)")
+            resumo_post = montar_resumo_por_post(resultados)
+            if "saudabilidade_score" in resumo_post.columns and resumo_post["saudabilidade_score"].notna().any():
+                media_saude = resumo_post["saudabilidade_score"].astype(float).mean()
+                cc1, cc2 = st.columns(2)
+                cc1.metric("Saudabilidade média (0-100)", f"{media_saude:.0f}")
+                cc2.metric("Posts analisados", len(resumo_post))
+            st.dataframe(resumo_post, use_container_width=True)
+            st.caption(
+                "💡 'saudabilidade_score' e 'classificação' são geradas pelo Gemini a partir da "
+                "distribuição de sentimento + métricas do post. 'compartilhamentos_post' fica vazio "
+                "porque nenhum Actor atual retorna esse dado do Instagram/TikTok."
+            )
+
+        st.markdown("##### Consultar comentários")
+        if tem_alvo:
+            c1, c2 = st.columns(2)
+            filtro_sent = c1.multiselect(
+                "Mostrar sentimentos", ["Positivo", "Neutro", "Negativo"],
+                default=["Positivo", "Neutro", "Negativo"],
+            )
+            alvos_disponiveis = sorted(resultados["alvo"].dropna().unique().tolist())
+            filtro_alvo = c2.multiselect("Mostrar alvos", alvos_disponiveis, default=alvos_disponiveis)
+            mascara = resultados["sentimento"].isin(filtro_sent) & resultados["alvo"].isin(filtro_alvo)
+        else:
+            filtro_sent = st.multiselect(
+                "Mostrar sentimentos", ["Positivo", "Neutro", "Negativo"],
+                default=["Positivo", "Neutro", "Negativo"],
+            )
+            mascara = resultados["sentimento"].isin(filtro_sent)
+        st.dataframe(resultados[mascara], use_container_width=True)
+
+        st.markdown("##### 📋 Exemplos de comentários Neutros (para levar a clientes)")
+        neutros = resultados[resultados["sentimento"] == "Neutro"]
+        if neutros.empty:
+            st.caption("Nenhum comentário classificado como Neutro nesta rodada.")
+        else:
+            colunas_neutros = ["post_link", "autor", "comentario", "justificativa"]
+            if tem_alvo:
+                colunas_neutros.insert(3, "alvo")
+            st.dataframe(neutros[colunas_neutros], use_container_width=True)
+            st.download_button(
+                "⬇️ Baixar exemplos neutros (CSV)",
+                data=neutros.to_csv(index=False).encode("utf-8"),
+                file_name="exemplos_neutros.csv", mime="text/csv",
+            )
+
+        if st.session_state.relatorio_texto:
+            st.markdown("##### 📄 Análise aprofundada")
+            st.markdown(st.session_state.relatorio_texto)
+            st.download_button(
+                "⬇️ Baixar relatório (Markdown)",
+                data=st.session_state.relatorio_texto.encode("utf-8"),
+                file_name="analise_aprofundada.md", mime="text/markdown",
+            )
+
+        st.markdown("##### 💾 Salvar / exportar (post_comments)")
+        st.caption(
+            "Exportação completa: comentário + sentimento + justificativa + saudabilidade do "
+            "post (Gemini) + métricas (curtidas, comentários do post, views, plays e "
+            "compartilhamentos — este último fica vazio, pois nenhum Actor atual retorna esse "
+            "dado) + origem/campanha/marca/núcleo."
+        )
+        resumo_post_export = montar_resumo_por_post(resultados)
+        c1, c2 = st.columns(2)
+        with c1:
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                resultados.to_excel(writer, sheet_name="post_comments", index=False)
+                resumo_post_export.to_excel(writer, sheet_name="resumo_por_post", index=False)
+            st.download_button(
+                "⬇️ Baixar Excel completo (comentários + resumo por post)",
+                data=buffer.getvalue(), file_name="post_comments_completo.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+            st.caption(
+                "Aba 'post_comments' = 1 linha por comentário. Aba 'resumo_por_post' = 1 linha "
+                "por post, já agregada (sentimento + métricas + saudabilidade)."
+            )
+        with c2:
+            buffer_nucleo = io.BytesIO()
+            with pd.ExcelWriter(buffer_nucleo, engine="openpyxl") as writer:
+                grupos = resultados.groupby(resultados["nucleo"].replace("", "sem_nucleo").fillna("sem_nucleo"))
+                for nome, grupo in grupos:
+                    aba = str(nome)[:31] or "sem_nucleo"
+                    grupo.to_excel(writer, sheet_name=aba, index=False)
+            st.download_button(
+                "⬇️ Baixar Excel por núcleo",
+                data=buffer_nucleo.getvalue(), file_name="post_comments_por_nucleo.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        if not is_bq_configured():
+            st.caption(
+                "🟡 BigQuery ainda não configurado — por enquanto o fluxo oficial é exportar em "
+                "Excel (acima). Quando estiver pronto, o botão abaixo passa a gravar direto na tabela "
+                f"`{st.session_state.bq_table_post_comments}`."
+            )
+        if st.button("💾 Salvar também no BigQuery (post_comments)", disabled=not is_bq_configured()):
+            with st.spinner("Salvando no BigQuery..."):
+                try:
+                    table_id = salvar_df_bigquery(resultados, st.session_state.bq_table_post_comments)
+                    log(f"{len(resultados)} linhas salvas em {table_id}.")
+                    st.success(f"Salvo em `{table_id}`.")
+                except Exception as e:
+                    st.error(f"Erro ao salvar no BigQuery: {e}")
 
 # ----------------------------------------------------------------------
-# 📸 POSTS & PERFIS (INSTAGRAM) — métricas: curtidas, comentários, views...
+# 📸 POSTS & PERFIS (INSTAGRAM) — consulta avulsa, fora do fluxo de campanha
 # ----------------------------------------------------------------------
 with tabs["📸 Posts & Perfis (IG)"]:
     st.subheader("Posts, Reels e Perfis do Instagram (com métricas)")
     st.caption(
-        "Cole links de **perfil** (ex.: `instagram.com/usuario/`) para trazer os últimos "
-        "posts/reels dele, ou links de **post/reel específico** para pegar só aquele "
-        "conteúdo — com curtidas, comentários e views. Também dá pra puxar só os "
-        "**dados do perfil** (seguidores, bio, verificado, etc.). "
-        "⚠️ O Instagram não expõe número de compartilhamentos via scraping, então esse "
+        "Consulta avulsa — não depende de ter rodado uma análise em '🚀 Análise'. Cole links de "
+        "**perfil** (ex.: `instagram.com/usuario/`) para trazer os últimos posts/reels dele, ou "
+        "links de **post/reel específico** para pegar só aquele conteúdo, com curtidas, "
+        "comentários e views. Também dá pra puxar só os **dados do perfil** (seguidores, bio, "
+        "verificado, etc.). ⚠️ O Instagram não expõe compartilhamentos via scraping, então esse "
         "campo não está disponível aqui."
     )
 
@@ -1102,9 +1944,7 @@ with tabs["📸 Posts & Perfis (IG)"]:
         if st.session_state.ig_posts_results_type == "posts":
             st.session_state.ig_posts_limit = st.number_input(
                 "Máx. de posts/reels por link",
-                min_value=1,
-                max_value=200,
-                value=st.session_state.ig_posts_limit,
+                min_value=1, max_value=200, value=st.session_state.ig_posts_limit,
             )
 
     links_preview = [l.strip() for l in st.session_state.ig_posts_links_input.splitlines() if l.strip()]
@@ -1136,10 +1976,7 @@ with tabs["📸 Posts & Perfis (IG)"]:
                         )
                         if items:
                             custo_real = registrar_gasto("instagram_posts", len(items))
-                            log(
-                                f"Apify (posts/perfis IG) retornou {len(items)} registro(s) — "
-                                f"custo: ${custo_real:.4f}."
-                            )
+                            log(f"Apify (posts/perfis IG) retornou {len(items)} registro(s) — custo: ${custo_real:.4f}.")
                         else:
                             log("Apify (posts/perfis IG) não retornou registros.")
                     except Exception as e:
@@ -1174,10 +2011,8 @@ with tabs["📸 Posts & Perfis (IG)"]:
 
             fig_metricas = px.bar(
                 df_posts.sort_values("likes_post", ascending=False).head(20),
-                x="shortcode",
-                y=["likes_post", "comentarios_post"],
-                title="Curtidas x Comentários por post/reel (top 20)",
-                barmode="group",
+                x="shortcode", y=["likes_post", "comentarios_post"],
+                title="Curtidas x Comentários por post/reel (top 20)", barmode="group",
             )
             fig_metricas.update_xaxes(tickangle=45)
             st.plotly_chart(fig_metricas, use_container_width=True)
@@ -1194,8 +2029,7 @@ with tabs["📸 Posts & Perfis (IG)"]:
             st.download_button(
                 "⬇️ Baixar CSV",
                 data=df_posts.to_csv(index=False).encode("utf-8"),
-                file_name="posts_perfis_instagram.csv",
-                mime="text/csv",
+                file_name="posts_perfis_instagram.csv", mime="text/csv",
             )
         with c2:
             buffer_posts = io.BytesIO()
@@ -1203,8 +2037,7 @@ with tabs["📸 Posts & Perfis (IG)"]:
                 df_posts.to_excel(writer, sheet_name="posts_perfis_ig", index=False)
             st.download_button(
                 "⬇️ Baixar Excel",
-                data=buffer_posts.getvalue(),
-                file_name="posts_perfis_instagram.xlsx",
+                data=buffer_posts.getvalue(), file_name="posts_perfis_instagram.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
@@ -1219,236 +2052,18 @@ with tabs["📸 Posts & Perfis (IG)"]:
                 st.error(f"Erro ao salvar no BigQuery: {e}")
 
 # ----------------------------------------------------------------------
-# 3) SENTIMENTALIZAÇÃO - VISÃO GERAL + EXEMPLOS NEUTROS
-# ----------------------------------------------------------------------
-with tabs["3️⃣ Sentimentalização"]:
-    st.subheader("Visão geral dos sentimentos")
-    resultados = st.session_state.resultados_df
-    if resultados is None or resultados.empty:
-        st.info("Rode a coleta + análise na aba anterior primeiro.")
-    else:
-        st.session_state.current_stage = max(st.session_state.current_stage, 3)
-        contagem = resultados["sentimento"].value_counts().reset_index()
-        contagem.columns = ["sentimento", "quantidade"]
-
-        total = len(resultados)
-        pos = int(resultados["sentimento"].eq("Positivo").sum())
-        neg = int(resultados["sentimento"].eq("Negativo").sum())
-        neu = total - pos - neg
-        c1, c2, c3 = st.columns(3)
-        c1.metric("😊 Positivos", pos, f"{pos/total:.0%}")
-        c2.metric("😐 Neutros", neu, f"{neu/total:.0%}")
-        c3.metric("☹️ Negativos", neg, f"{neg/total:.0%}")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_pizza = px.pie(
-                contagem, names="sentimento", values="quantidade",
-                color="sentimento", color_discrete_map=SENTIMENT_COLORS,
-                title="Distribuição de sentimentos",
-            )
-            st.plotly_chart(fig_pizza, use_container_width=True)
-        with c2:
-            por_post = resultados.groupby(["post_link", "sentimento"]).size().reset_index(name="quantidade")
-            fig_barras = px.bar(
-                por_post, x="post_link", y="quantidade", color="sentimento",
-                color_discrete_map=SENTIMENT_COLORS, title="Sentimento por post", barmode="stack",
-            )
-            fig_barras.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_barras, use_container_width=True)
-
-        st.markdown("##### 📊 Resumo por post (métricas + saudabilidade)")
-        resumo_post = montar_resumo_por_post(resultados)
-        if "saudabilidade_score" in resumo_post.columns and resumo_post["saudabilidade_score"].notna().any():
-            media_saude = resumo_post["saudabilidade_score"].astype(float).mean()
-            c1, c2 = st.columns(2)
-            c1.metric("Saudabilidade média (0-100)", f"{media_saude:.0f}")
-            c2.metric("Posts analisados", len(resumo_post))
-        st.dataframe(resumo_post, use_container_width=True)
-        st.caption(
-            "💡 'saudabilidade_score' e 'classificação' são gerados pelo Gemini a partir da "
-            "distribuição de sentimento + métricas do post. 'compartilhamentos_post' fica "
-            "vazio porque nenhum dos Actors atuais retorna esse dado do Instagram/TikTok."
-        )
-
-        st.markdown("##### Filtrar / consultar comentários")
-        filtro = st.multiselect(
-            "Mostrar sentimentos", ["Positivo", "Neutro", "Negativo"],
-            default=["Positivo", "Neutro", "Negativo"],
-        )
-        st.dataframe(resultados[resultados["sentimento"].isin(filtro)], use_container_width=True)
-
-        st.markdown("##### 📋 Exemplos de comentários Neutros (para levar a clientes)")
-        neutros = resultados[resultados["sentimento"] == "Neutro"]
-        if neutros.empty:
-            st.caption("Nenhum comentário classificado como Neutro nesta rodada.")
-        else:
-            st.dataframe(
-                neutros[["post_link", "autor", "comentario", "justificativa"]],
-                use_container_width=True,
-            )
-            st.download_button(
-                "⬇️ Baixar exemplos neutros (CSV)",
-                data=neutros.to_csv(index=False).encode("utf-8"),
-                file_name="exemplos_neutros.csv",
-                mime="text/csv",
-            )
-
-# ----------------------------------------------------------------------
-# 4) RELATÓRIO APROFUNDADO
-# ----------------------------------------------------------------------
-with tabs["4️⃣ Relatório aprofundado"]:
-    st.subheader("Análise aprofundada do social da campanha")
-    st.caption(
-        "Gera um texto dissertativo, técnico e antropológico sobre o que os "
-        "comentários revelam — pensado para material de estudo entregável ao cliente."
-    )
-    resultados = st.session_state.resultados_df
-    if resultados is None or resultados.empty:
-        st.info("Rode a coleta + análise primeiro.")
-    else:
-        if not is_gemini_configured():
-            st.warning("Gemini não configurado — vai gerar um relatório-modelo simplificado (demo).")
-
-        if st.button("📄 Gerar análise aprofundada", type="primary"):
-            with st.spinner("Gemini está lendo os comentários e montando a análise..."):
-                contagem = resultados["sentimento"].value_counts()
-                total = len(resultados)
-                resumo = "\n".join(
-                    f"- {s}: {int(contagem.get(s,0))} comentários ({contagem.get(s,0)/total:.0%})"
-                    for s in ["Positivo", "Neutro", "Negativo"]
-                )
-                amostra_partes = []
-                for s in ["Positivo", "Neutro", "Negativo"]:
-                    exemplos = resultados[resultados["sentimento"] == s]["comentario"].head(8).tolist()
-                    if exemplos:
-                        amostra_partes.append(f"{s}:\n" + "\n".join(f'- "{c}"' for c in exemplos))
-                amostra = "\n\n".join(amostra_partes)
-
-                if is_gemini_configured():
-                    try:
-                        import google.generativeai as genai
-
-                        genai.configure(api_key=st.session_state.gemini_key)
-                        model = genai.GenerativeModel(st.session_state.gemini_model)
-                        prompt = (
-                            st.session_state.prompt_relatorio.replace("{{CAMPANHA}}", st.session_state.campanha or "Não informado")
-                            .replace("{{MARCA}}", st.session_state.marca or "Não informado")
-                            .replace("{{MOTHER_BRAND}}", st.session_state.mother_brand or "Não informado")
-                            .replace("{{NUCLEO}}", st.session_state.nucleo or "Não informado")
-                            .replace("{{BRIEFING}}", st.session_state.briefing or "Não informado")
-                            .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica")
-                            .replace("{{RESUMO_QUANTITATIVO}}", resumo)
-                            .replace("{{AMOSTRA_COMENTARIOS}}", amostra)
-                        )
-                        resp = model.generate_content(prompt)
-                        st.session_state.relatorio_texto = resp.text
-                        log("Relatório aprofundado gerado pelo Gemini.")
-                    except Exception as e:
-                        st.error(f"Erro ao chamar Gemini: {e}")
-                else:
-                    st.session_state.relatorio_texto = (
-                        f"# [DEMO] Análise aprofundada — {st.session_state.campanha or 'campanha sem nome'}\n\n"
-                        f"**Marca:** {st.session_state.marca or '-'} · "
-                        f"**Mother brand:** {st.session_state.mother_brand or '-'} · "
-                        f"**Núcleo:** {st.session_state.nucleo or '-'}\n\n"
-                        f"## Panorama geral\n\n{resumo}\n\n"
-                        "## Observação\n\nEste é um relatório simulado (modo demonstração) — "
-                        "configure a Gemini API Key para gerar a análise dissertativa completa, "
-                        "com insights, oportunidades, riscos e leitura antropológica do público."
-                    )
-                    log("[DEMO] Relatório-modelo gerado (Gemini não configurado).")
-
-        if st.session_state.relatorio_texto:
-            st.markdown(st.session_state.relatorio_texto)
-            st.download_button(
-                "⬇️ Baixar relatório (Markdown)",
-                data=st.session_state.relatorio_texto.encode("utf-8"),
-                file_name="analise_aprofundada.md",
-                mime="text/markdown",
-            )
-
-# ----------------------------------------------------------------------
-# 5) SALVAR / EXPORTAR (post_comments unificado)
-# ----------------------------------------------------------------------
-with tabs["5️⃣ Salvar / Exportar"]:
-    st.subheader("Salvar / exportar resultado final (post_comments)")
-    resultados = st.session_state.resultados_df
-    if resultados is None or resultados.empty:
-        st.info("Rode a coleta + análise primeiro.")
-    else:
-        st.caption(
-            "Exportação completa: comentários + sentimento + justificativa + saudabilidade "
-            "do post (Gemini) + métricas (curtidas, comentários do post, views, plays e "
-            "compartilhamentos — este último fica vazio, pois nenhum Actor atual retorna "
-            "esse dado) + origem (SIC/BR) + campanha + marca + núcleo."
-        )
-        resumo_post_export = montar_resumo_por_post(resultados)
-        st.dataframe(resultados, use_container_width=True)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                resultados.to_excel(writer, sheet_name="post_comments", index=False)
-                resumo_post_export.to_excel(writer, sheet_name="resumo_por_post", index=False)
-            st.download_button(
-                "⬇️ Baixar Excel completo (comentários + resumo por post)",
-                data=buffer.getvalue(),
-                file_name="post_comments_completo.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-            )
-            st.caption(
-                "Aba 'post_comments' = 1 linha por comentário (com métricas e saudabilidade "
-                "repetidas). Aba 'resumo_por_post' = 1 linha por post, já agregado."
-            )
-        with c2:
-            buffer_nucleo = io.BytesIO()
-            with pd.ExcelWriter(buffer_nucleo, engine="openpyxl") as writer:
-                grupos = resultados.groupby(
-                    resultados["nucleo"].replace("", "sem_nucleo").fillna("sem_nucleo")
-                )
-                for nome, grupo in grupos:
-                    aba = str(nome)[:31] or "sem_nucleo"
-                    grupo.to_excel(writer, sheet_name=aba, index=False)
-            st.download_button(
-                "⬇️ Baixar Excel por núcleo (uma aba por núcleo)",
-                data=buffer_nucleo.getvalue(),
-                file_name="post_comments_por_nucleo.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-        st.divider()
-        if not is_bq_configured():
-            st.caption(
-                "🟡 BigQuery ainda não configurado — por enquanto o fluxo oficial é "
-                "exportar em Excel (acima) e integrar com o PowerBI a partir dele. "
-                "Assim que o BigQuery estiver pronto, o botão abaixo passa a gravar "
-                f"direto na tabela `{st.session_state.bq_table_post_comments}`."
-            )
-        if st.button("💾 Salvar também no BigQuery (post_comments)", disabled=not is_bq_configured()):
-            with st.spinner("Salvando no BigQuery..."):
-                try:
-                    table_id = salvar_df_bigquery(resultados, st.session_state.bq_table_post_comments)
-                    log(f"{len(resultados)} linhas salvas em {table_id}.")
-                    st.success(f"Salvo em `{table_id}`.")
-                    st.session_state.current_stage = 5
-                except Exception as e:
-                    st.error(f"Erro ao salvar no BigQuery: {e}")
-
-# ----------------------------------------------------------------------
-# 6) GASTOS
+# GASTOS
 # ----------------------------------------------------------------------
 with tabs["💰 Gastos"]:
-    st.subheader("Histórico de gastos com extração de comentários")
+    st.subheader("Histórico de gastos com extração de comentários (Apify)")
     st.caption(
         f"Instagram (comentários): ${RATE_PER_1000['instagram']:.2f} por mil · "
         f"TikTok (comentários): ${RATE_PER_1000['tiktok']:.2f} por mil · "
-        f"Instagram (posts/perfis): ${RATE_PER_1000['instagram_posts']:.2f} por mil itens."
+        f"Instagram (posts/perfis): ${RATE_PER_1000['instagram_posts']:.2f} por mil itens. "
+        "Planilhas do Pulsar não geram custo de coleta (só de métricas/saudabilidade, se ativado)."
     )
     if not st.session_state.gastos:
-        st.caption("Nenhum gasto registrado ainda — rode uma coleta na aba 2.")
+        st.caption("Nenhum gasto registrado ainda.")
     else:
         df_gastos = pd.DataFrame(st.session_state.gastos)
         total_geral = df_gastos["custo_usd"].sum()
@@ -1469,16 +2084,12 @@ with tabs["💰 Gastos"]:
         st.download_button(
             "⬇️ Baixar histórico de gastos (CSV)",
             data=df_gastos.to_csv(index=False).encode("utf-8"),
-            file_name="gastos.csv",
-            mime="text/csv",
+            file_name="gastos.csv", mime="text/csv",
         )
-    st.caption(
-        "O histórico acima é desta sessão. Configure o BigQuery para manter o "
-        "histórico salvo entre sessões e entre usuários diferentes."
-    )
+    st.caption("O histórico acima é desta sessão. Configure o BigQuery para manter salvo entre sessões.")
 
 # ----------------------------------------------------------------------
-# 7) CONFIGURAÇÕES (somente admin / usuários com permissão)
+# CONFIGURAÇÕES (somente admin / usuários com permissão)
 # ----------------------------------------------------------------------
 if "⚙️ Configurações" in tabs:
     with tabs["⚙️ Configurações"]:
@@ -1557,32 +2168,83 @@ if "⚙️ Configurações" in tabs:
             )
 
         with subtab_prompts:
-            st.markdown("#### Prompt de sentimentalização")
             st.caption(
-                "Usado para classificar cada comentário. Placeholders disponíveis: "
-                "`{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{COMENTARIO}}`."
+                "A análise completa roda em 3 etapas de prompt: 1) classifica o sentimento em "
+                "lotes de comentários, 2) lê cada bloco de comentários e extrai um resumo fiel, "
+                "3) sintetiza todos os resumos num relatório final único."
+            )
+            st.markdown("#### 1a. Prompt de sentimentalização — Pulsar (reclassificação)")
+            st.caption(
+                f"Usado só quando a fonte é Pulsar e a caixa 'Reclassificar com Gemini' está marcada. "
+                f"Classifica um lote de até {TAMANHO_LOTE_CLASSIFICACAO} comentários por chamada. "
+                "Placeholders: `{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{COMENTARIOS_NUMERADOS}}`."
             )
             st.session_state.prompt_sentimento = st.text_area(
-                "Prompt de sentimentalização", value=st.session_state.prompt_sentimento, height=220
+                "Prompt de sentimentalização (Pulsar)", value=st.session_state.prompt_sentimento, height=200
             )
             c1, c2 = st.columns(2)
-            if c1.button("💾 Salvar prompt de sentimentalização"):
+            if c1.button("💾 Salvar prompt de sentimentalização (Pulsar)"):
                 salvar_prompts()
-                log("Prompt de sentimentalização atualizado.")
+                log("Prompt de sentimentalização (Pulsar) atualizado.")
                 st.success("Salvo.")
-            if c2.button("↩️ Restaurar prompt padrão de sentimentalização"):
+            if c2.button("↩️ Restaurar prompt padrão (Pulsar)"):
                 st.session_state.prompt_sentimento = DEFAULT_PROMPT_SENTIMENTO
                 salvar_prompts()
                 st.rerun()
 
             st.divider()
-            st.markdown("#### Prompt do relatório aprofundado")
+            st.markdown("#### 1b. Prompt de sentimentalização — Apify (com alvo, emoção e pertinência)")
             st.caption(
+                "Usado só para comentários coletados via Apify (Campanha BR / SIC). Além do "
+                "sentimento, classifica o **alvo** do comentário (conteúdo/marca/produto-serviço/"
+                "preço), a **emoção** predominante e a **pertinência** com a campanha — dá pra "
+                "filtrar as amostras por essas categorias depois. Placeholders: `{{CAMPANHA}}`, "
+                "`{{MARCA}}`, `{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{COMENTARIOS_NUMERADOS}}`."
+            )
+            st.session_state.prompt_sentimento_apify = st.text_area(
+                "Prompt de sentimentalização (Apify)", value=st.session_state.prompt_sentimento_apify, height=260
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("💾 Salvar prompt de sentimentalização (Apify)"):
+                salvar_prompts()
+                log("Prompt de sentimentalização (Apify) atualizado.")
+                st.success("Salvo.")
+            if c2.button("↩️ Restaurar prompt padrão (Apify)"):
+                st.session_state.prompt_sentimento_apify = DEFAULT_PROMPT_SENTIMENTO_APIFY
+                salvar_prompts()
+                st.rerun()
+
+            st.divider()
+            st.markdown("#### 2. Prompt de leitura por bloco (análise aprofundada)")
+            st.caption(
+                f"Lê um bloco de até {TAMANHO_CHUNK_ANALISE} comentários e extrai um resumo fiel — "
+                "essa é a etapa que garante que o relatório final não fuja do que está realmente "
+                "escrito nos comentários. Placeholders: `{{CONTEXTO}}`, `{{TOTAL_BLOCO}}`, "
+                "`{{COMENTARIOS_BLOCO}}`."
+            )
+            st.session_state.prompt_analise_bloco = st.text_area(
+                "Prompt de análise por bloco", value=st.session_state.prompt_analise_bloco, height=200
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("💾 Salvar prompt de análise por bloco"):
+                salvar_prompts()
+                log("Prompt de análise por bloco atualizado.")
+                st.success("Salvo.")
+            if c2.button("↩️ Restaurar prompt padrão de análise por bloco"):
+                st.session_state.prompt_analise_bloco = DEFAULT_PROMPT_ANALISE_BLOCO
+                salvar_prompts()
+                st.rerun()
+
+            st.divider()
+            st.markdown("#### 3. Prompt de síntese (relatório final)")
+            st.caption(
+                "Junta todos os resumos de blocos + o resumo quantitativo num relatório final único. "
                 "Placeholders: `{{CAMPANHA}}`, `{{MARCA}}`, `{{MOTHER_BRAND}}`, `{{NUCLEO}}`, "
-                "`{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{RESUMO_QUANTITATIVO}}`, `{{AMOSTRA_COMENTARIOS}}`."
+                "`{{BRIEFING}}`, `{{DIRETRIZES}}`, `{{RESUMO_QUANTITATIVO}}`, `{{RESUMOS_DOS_BLOCOS}}`, "
+                "`{{AMOSTRA_COMENTARIOS}}`."
             )
             st.session_state.prompt_relatorio = st.text_area(
-                "Prompt do relatório aprofundado", value=st.session_state.prompt_relatorio, height=260
+                "Prompt do relatório aprofundado (síntese)", value=st.session_state.prompt_relatorio, height=260
             )
             c1, c2 = st.columns(2)
             if c1.button("💾 Salvar prompt do relatório"):
@@ -1595,11 +2257,12 @@ if "⚙️ Configurações" in tabs:
                 st.rerun()
 
             st.divider()
-            st.markdown("#### Prompt de saudabilidade do post")
+            st.markdown("#### 4. Prompt de saudabilidade dos posts")
             st.caption(
-                "Roda 1x por post (não por comentário), a partir da distribuição de "
-                "sentimento já calculada. Placeholders: `{{MARCA}}`, `{{CAMPANHA}}`, "
-                "`{{DIRETRIZES}}`, `{{RESUMO_SENTIMENTO}}`, `{{METRICAS_POST}}`."
+                "Roda em lote (até "
+                f"{TAMANHO_LOTE_SAUDABILIDADE} posts por chamada), a partir da distribuição de "
+                "sentimento já calculada + métricas do post (quando disponíveis). Placeholders: "
+                "`{{MARCA}}`, `{{CAMPANHA}}`, `{{DIRETRIZES}}`, `{{POSTS_NUMERADOS}}`."
             )
             st.session_state.prompt_saudabilidade = st.text_area(
                 "Prompt de saudabilidade", value=st.session_state.prompt_saudabilidade, height=220
@@ -1691,10 +2354,7 @@ with tabs["🪵 Log"]:
     else:
         st.code("\n".join(st.session_state.log), language=None)
 
-    if st.button("🔄 Reiniciar fluxo (limpar comentários, resultados e relatório)"):
-        for key in (
-            "links_input", "links_list", "comentarios_df", "resultados_df",
-            "relatorio_texto", "current_stage", "log",
-        ):
+    if st.button("🔄 Limpar resultado atual (comentários, sentimento e relatório)"):
+        for key in ("links_input", "resultados_df", "relatorio_texto", "log", "job"):
             st.session_state[key] = DEFAULTS[key]
         st.rerun()
