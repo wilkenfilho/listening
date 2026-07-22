@@ -11,6 +11,7 @@ import json
 import math
 import os
 import random
+import re
 import time
 from datetime import datetime
 
@@ -373,6 +374,42 @@ def detectar_plataforma(link: str) -> str:
     if "tiktok.com" in l:
         return "tiktok"
     return "desconhecido"
+
+
+_REGEX_URL_REDES = re.compile(
+    r"https?://(?:www\.)?(?:instagram\.com|tiktok\.com)/[^\s\)\]\"'<>]+", re.IGNORECASE
+)
+
+
+def extrair_urls_redes(texto: str) -> list:
+    """Extrai links do Instagram/TikTok de um texto colado — funciona mesmo se vier
+    com título junto (ex.: '[Nome (@user) • Reel do Instagram](https://instagram.com/p/ABC/)')
+    ou com várias linhas, cada uma com ruído ao redor do link."""
+    if not texto:
+        return []
+    encontrados = []
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        matches = _REGEX_URL_REDES.findall(linha)
+        if matches:
+            for m in matches:
+                url = m.rstrip(").,;:!?")
+                if url not in encontrados:
+                    encontrados.append(url)
+        elif "instagram.com" in linha.lower() or "tiktok.com" in linha.lower():
+            # linha com o domínio mas sem "http" reconhecido pelo regex — mantém
+            # como veio, é melhor tentar do que descartar silenciosamente
+            if linha not in encontrados:
+                encontrados.append(linha)
+    return encontrados
+
+
+def extrair_urls_instagram(texto: str) -> list:
+    """Igual a extrair_urls_redes, mas filtrando só links do Instagram (usado na
+    aba de Posts & Perfis, que só trabalha com o Actor do Instagram)."""
+    return [u for u in extrair_urls_redes(texto) if "instagram.com" in u.lower()]
 
 
 def calcular_custo(plataforma: str, qtd_comentarios: int) -> float:
@@ -1594,7 +1631,7 @@ with tabs["🚀 Análise"]:
     # ---------------- ETA prévio (antes de clicar em rodar) ----------------
     if not job_ativo:
         if st.session_state.fonte == FONTES[0]:
-            links_previa = [l.strip() for l in st.session_state.links_input.splitlines() if l.strip()]
+            links_previa = extrair_urls_redes(st.session_state.links_input)
             n_ig = sum(1 for l in links_previa if detectar_plataforma(l) == "instagram")
             n_tk = sum(1 for l in links_previa if detectar_plataforma(l) == "tiktok")
             n_estimado = n_ig * st.session_state.ig_limit + n_tk * st.session_state.tk_limit
@@ -1632,7 +1669,7 @@ with tabs["🚀 Análise"]:
                     st.session_state.relatorio_texto = ""
                     st.rerun()
             else:
-                links = [l.strip() for l in st.session_state.links_input.splitlines() if l.strip()]
+                links = extrair_urls_redes(st.session_state.links_input)
                 if not links:
                     st.warning("Cole ao menos um link antes de rodar.")
                 else:
@@ -1909,26 +1946,27 @@ with tabs["🚀 Análise"]:
 # 📸 POSTS & PERFIS (INSTAGRAM) — consulta avulsa, fora do fluxo de campanha
 # ----------------------------------------------------------------------
 with tabs["📸 Posts & Perfis (IG)"]:
-    st.subheader("Posts, Reels e Perfis do Instagram (com métricas)")
+    st.subheader("Números de posts e reels do Instagram")
     st.caption(
-        "Consulta avulsa — não depende de ter rodado uma análise em '🚀 Análise'. Cole links de "
-        "**perfil** (ex.: `instagram.com/usuario/`) para trazer os últimos posts/reels dele, ou "
-        "links de **post/reel específico** para pegar só aquele conteúdo, com curtidas, "
-        "comentários e views. Também dá pra puxar só os **dados do perfil** (seguidores, bio, "
-        "verificado, etc.). ⚠️ O Instagram não expõe compartilhamentos via scraping, então esse "
-        "campo não está disponível aqui."
+        "Cole o link do post/reel (pode colar com título junto, tipo copiar de uma busca — "
+        "o app extrai a URL sozinho) e receba curtidas, comentários e views. Dá pra colar "
+        "vários links de uma vez, um por linha. Também dá pra puxar links de **perfil** "
+        "(ex.: `instagram.com/usuario/`) pra trazer os últimos posts/reels dele, ou só os "
+        "**dados do perfil** (seguidores, bio, verificado...). ⚠️ Compartilhamentos não "
+        "aparecem porque o Instagram não expõe esse número via scraping — nenhuma "
+        "ferramenta de coleta automática consegue puxar isso hoje."
     )
 
     c1, c2 = st.columns([2, 1])
     with c1:
         st.session_state.ig_posts_links_input = st.text_area(
-            "Links do Instagram — perfis e/ou posts/reels, um por linha",
+            "Links do Instagram — um por linha (funciona colar com título junto)",
             value=st.session_state.ig_posts_links_input,
             height=130,
             placeholder=(
-                "https://www.instagram.com/humansofny/\n"
+                "[Mariana Menezes (@marimenezees_) • Reel do Instagram](https://www.instagram.com/p/DaZJ741tEWf/)\n"
                 "https://www.instagram.com/p/DZxvMgyH8yR/\n"
-                "https://www.instagram.com/nasawebb/reels/"
+                "https://www.instagram.com/humansofny/"
             ),
             key="ig_posts_links_area",
         )
@@ -1947,7 +1985,7 @@ with tabs["📸 Posts & Perfis (IG)"]:
                 min_value=1, max_value=200, value=st.session_state.ig_posts_limit,
             )
 
-    links_preview = [l.strip() for l in st.session_state.ig_posts_links_input.splitlines() if l.strip()]
+    links_preview = extrair_urls_instagram(st.session_state.ig_posts_links_input)
     if links_preview and st.session_state.ig_posts_results_type == "posts":
         custo_estimado_posts = (
             (len(links_preview) * st.session_state.ig_posts_limit / 1000) * RATE_PER_1000["instagram_posts"]
@@ -1961,7 +1999,7 @@ with tabs["📸 Posts & Perfis (IG)"]:
         st.warning("Apify não configurado — vai mostrar dados de demonstração.")
 
     if st.button("🚀 Buscar no Instagram", type="primary", key="btn_buscar_posts_ig"):
-        links_posts = [l.strip() for l in st.session_state.ig_posts_links_input.splitlines() if l.strip()]
+        links_posts = extrair_urls_instagram(st.session_state.ig_posts_links_input)
         if not links_posts:
             st.warning("Cole ao menos um link.")
         else:
@@ -2003,26 +2041,41 @@ with tabs["📸 Posts & Perfis (IG)"]:
     df_posts = st.session_state.ig_posts_df
     if df_posts is not None and not df_posts.empty:
         if "likes_post" in df_posts.columns:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Posts/Reels", len(df_posts))
-            c2.metric("Curtidas (total)", int(df_posts["likes_post"].fillna(0).sum()))
-            c3.metric("Comentários (total)", int(df_posts["comentarios_post"].fillna(0).sum()))
-            c4.metric("Views (total)", int(df_posts["views_post"].fillna(0).sum()))
+            if len(df_posts) > 1:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Posts/Reels", len(df_posts))
+                c2.metric("Curtidas (total)", int(df_posts["likes_post"].fillna(0).sum()))
+                c3.metric("Comentários (total)", int(df_posts["comentarios_post"].fillna(0).sum()))
+                c4.metric("Views (total)", int(df_posts["views_post"].fillna(0).sum()))
+                st.divider()
 
-            fig_metricas = px.bar(
-                df_posts.sort_values("likes_post", ascending=False).head(20),
-                x="shortcode", y=["likes_post", "comentarios_post"],
-                title="Curtidas x Comentários por post/reel (top 20)", barmode="group",
-            )
-            fig_metricas.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_metricas, use_container_width=True)
+            st.markdown("##### 🔢 Números por post")
+            for _, linha in df_posts.iterrows():
+                with st.container(border=True):
+                    titulo = f"@{linha.get('owner_username','')}" if linha.get("owner_username") else linha.get("link", "")
+                    st.markdown(f"**{titulo}** — {linha.get('link','')}")
+                    cc1, cc2, cc3, cc4 = st.columns(4)
+                    cc1.metric("❤️ Curtidas", f"{int(linha['likes_post']):,}".replace(",", ".") if pd.notna(linha.get("likes_post")) else "—")
+                    cc2.metric("💬 Comentários", f"{int(linha['comentarios_post']):,}".replace(",", ".") if pd.notna(linha.get("comentarios_post")) else "—")
+                    views_val = linha.get("views_post") if pd.notna(linha.get("views_post")) else linha.get("plays_post")
+                    cc3.metric("👁️ Views", f"{int(views_val):,}".replace(",", ".") if pd.notna(views_val) else "—")
+                    cc4.metric("🔁 Compartilhamentos", "Indisponível", help="O Instagram não expõe compartilhamentos via scraping — nenhum Actor atual retorna esse número.")
+
+            with st.expander("📋 Ver tabela completa (todos os campos)"):
+                fig_metricas = px.bar(
+                    df_posts.sort_values("likes_post", ascending=False).head(20),
+                    x="shortcode", y=["likes_post", "comentarios_post"],
+                    title="Curtidas x Comentários por post/reel (top 20)", barmode="group",
+                )
+                fig_metricas.update_xaxes(tickangle=45)
+                st.plotly_chart(fig_metricas, use_container_width=True)
+                st.dataframe(df_posts, use_container_width=True)
         elif "seguidores" in df_posts.columns:
             c1, c2, c3 = st.columns(3)
             c1.metric("Perfis coletados", len(df_posts))
             c2.metric("Seguidores (soma)", int(df_posts["seguidores"].fillna(0).sum()))
             c3.metric("Posts publicados (soma)", int(df_posts["qtd_posts"].fillna(0).sum()))
-
-        st.dataframe(df_posts, use_container_width=True)
+            st.dataframe(df_posts, use_container_width=True)
 
         c1, c2 = st.columns(2)
         with c1:
