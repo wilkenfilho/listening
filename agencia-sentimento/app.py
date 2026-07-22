@@ -412,6 +412,16 @@ def extrair_urls_instagram(texto: str) -> list:
     return [u for u in extrair_urls_redes(texto) if "instagram.com" in u.lower()]
 
 
+_REGEX_POST_ESPECIFICO = re.compile(r"instagram\.com/(?:p|reel|tv)/[A-Za-z0-9_-]+", re.IGNORECASE)
+
+
+def eh_link_post_especifico(url: str) -> bool:
+    """True se o link já aponta pra um post/reel específico (tem shortcode na URL,
+    ex.: /p/ABC123/ ou /reel/ABC123/). False se for link de perfil (ex.: /usuario/
+    ou /usuario/reels/), onde faz sentido perguntar quantos posts recentes trazer."""
+    return bool(_REGEX_POST_ESPECIFICO.search(url or ""))
+
+
 def calcular_custo(plataforma: str, qtd_comentarios: int) -> float:
     return (qtd_comentarios / 1000) * RATE_PER_1000.get(plataforma, 0)
 
@@ -1970,6 +1980,10 @@ with tabs["📸 Posts & Perfis (IG)"]:
             ),
             key="ig_posts_links_area",
         )
+
+    links_preview = extrair_urls_instagram(st.session_state.ig_posts_links_input)
+    tem_link_perfil = any(not eh_link_post_especifico(u) for u in links_preview)
+
     with c2:
         tipo_busca_label = st.selectbox(
             "O que buscar",
@@ -1980,16 +1994,22 @@ with tabs["📸 Posts & Perfis (IG)"]:
             "posts" if tipo_busca_label.startswith("Posts") else "details"
         )
         if st.session_state.ig_posts_results_type == "posts":
-            st.session_state.ig_posts_limit = st.number_input(
-                "Máx. de posts/reels por link",
-                min_value=1, max_value=200, value=st.session_state.ig_posts_limit,
-            )
+            if tem_link_perfil:
+                st.session_state.ig_posts_limit = st.number_input(
+                    "Máx. de posts/reels por perfil colado",
+                    min_value=1, max_value=200, value=st.session_state.ig_posts_limit,
+                    help=(
+                        "Só vale pra link(s) de perfil (ex.: instagram.com/usuario/). Link de "
+                        "post/reel específico sempre traz só aquele item, esse número não afeta."
+                    ),
+                )
+            elif links_preview:
+                st.caption("✅ Só post(s)/reel(s) específico(s) — traz exatamente os itens colados, sem precisar de limite.")
 
-    links_preview = extrair_urls_instagram(st.session_state.ig_posts_links_input)
+    limite_efetivo = st.session_state.ig_posts_limit if tem_link_perfil else 1
+
     if links_preview and st.session_state.ig_posts_results_type == "posts":
-        custo_estimado_posts = (
-            (len(links_preview) * st.session_state.ig_posts_limit / 1000) * RATE_PER_1000["instagram_posts"]
-        )
+        custo_estimado_posts = (len(links_preview) * limite_efetivo / 1000) * RATE_PER_1000["instagram_posts"]
         st.caption(
             f"💸 Custo máx. estimado desta busca: **${custo_estimado_posts:.2f}** "
             f"(${RATE_PER_1000['instagram_posts']:.2f} por mil itens do Actor de posts/perfis)."
@@ -2003,6 +2023,7 @@ with tabs["📸 Posts & Perfis (IG)"]:
         if not links_posts:
             st.warning("Cole ao menos um link.")
         else:
+            limite_busca = st.session_state.ig_posts_limit if any(not eh_link_post_especifico(u) for u in links_posts) else 1
             with st.spinner("Buscando no Instagram..."):
                 items = []
                 if is_apify_configured():
@@ -2010,7 +2031,7 @@ with tabs["📸 Posts & Perfis (IG)"]:
                         items = coletar_posts_ig(
                             links_posts,
                             results_type=st.session_state.ig_posts_results_type,
-                            limit=st.session_state.ig_posts_limit,
+                            limit=limite_busca,
                         )
                         if items:
                             custo_real = registrar_gasto("instagram_posts", len(items))
