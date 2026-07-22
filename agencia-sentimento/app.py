@@ -489,12 +489,14 @@ def coletar_posts_ig(links: list, results_type: str = "posts", limit: int = 12, 
         "resultsType": results_type,
         "directUrls": links,
         "resultsLimit": limit,
-        "onlyPostsNewerThan": only_newer_than,
-        "search": None,
         "searchType": "hashtag",
         "searchLimit": 10,
         "addParentData": False,
     }
+    # Campos opcionais: a Apify valida o schema e rejeita `None` em campos do tipo
+    # string — só mandamos essas chaves quando têm valor de verdade.
+    if only_newer_than:
+        run_input["onlyPostsNewerThan"] = only_newer_than
     run = client.actor(ACTOR_INSTAGRAM_POSTS).call(run_input=run_input)
     if isinstance(run, dict):
         dataset_id = run.get("defaultDatasetId")
