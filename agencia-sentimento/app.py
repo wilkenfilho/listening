@@ -3,7 +3,9 @@ Painel de Análise de Sentimentos em Comentários (SIC + Campanhas BR)
 Pipeline: Links/contexto -> Apify (coleta) -> Gemini (sentimentalização automática)
           -> Sentimentalização (visão geral) -> Relatório aprofundado -> Salvar/Exportar
 Inclui: gastos por extração/usuário, login Google restrito ao domínio, menu de
-Configurações restrito ao admin (chaves de API, prompts do Gemini e acesso de usuários).
+Configurações restrito ao admin (chaves de API, prompts do Gemini e acesso de usuários),
+coleta de Posts/Reels/Perfis do Instagram (métricas) e enriquecimento automático dos
+comentários com números do post (curtidas, comentários, views).
 """
 
 import io
@@ -32,8 +34,9 @@ ADMIN_EMAIL = "wilken.perez@br-mediagroup.com"
 
 ACTOR_INSTAGRAM = "SbK00X0JYCPblD2wp"  # Instagram Comments Scraper
 ACTOR_TIKTOK = "BDec00yAmCm1QbMEI"     # TikTok Comments Scraper
+ACTOR_INSTAGRAM_POSTS = "shu8hvrXbJbY3Eb9W"  # Instagram Scraper (posts/reels/perfis)
 
-RATE_PER_1000 = {"instagram": 1.90, "tiktok": 0.50}
+RATE_PER_1000 = {"instagram": 1.90, "tiktok": 0.50, "instagram_posts": 1.50}
 SENTIMENT_COLORS = {"Positivo": "#22C55E", "Neutro": "#94A3B8", "Negativo": "#EF4444"}
 ORIGENS = ["Campanha BR (Apify)", "SIC - Reels", "SIC - TikTok"]
 
@@ -77,6 +80,25 @@ nesta ordem:
 
 Escreva em português, tom técnico mas acessível, como material de estudo entregável ao cliente."""
 
+DEFAULT_PROMPT_SAUDABILIDADE = """Você é um analista de social listening avaliando a 'saudabilidade' \
+(saúde do engajamento e da percepção do público) de um post/conteúdo, com base no sentimento dos
+comentários já analisados e nas métricas do post.
+
+Marca: {{MARCA}} | Campanha: {{CAMPANHA}}
+Diretrizes da marca: {{DIRETRIZES}}
+
+Distribuição de sentimento dos comentários analisados:
+{{RESUMO_SENTIMENTO}}
+
+Métricas do post: {{METRICAS_POST}}
+
+Com base nisso, avalie a saudabilidade deste post/conteúdo para a marca.
+Responda SOMENTE em JSON, neste formato exato:
+{"saudabilidade_score": 0, "classificacao": "Saudável", "resumo": "explicação curta em português, 1-2 frases"}
+
+Onde "saudabilidade_score" é um número de 0 a 100 (100 = ótima recepção do público, sem riscos;
+0 = crise/rejeição forte do público) e "classificacao" é uma destas: "Saudável", "Atenção" ou "Crítico"."""
+
 STAGES = [
     {"label": "Links + contexto", "color": "#FDE68A"},
     {"label": "Apify (coleta)", "color": "#FDE68A"},
@@ -84,6 +106,71 @@ STAGES = [
     {"label": "Sentimentalização", "color": "#BFDBFE"},
     {"label": "Relatório aprofundado", "color": "#BFDBFE"},
     {"label": "Salvar / Exportar", "color": "#BFDBFE"},
+]
+
+# Amostras usadas somente em modo demonstração (Apify não configurado), para a
+# aba de Posts/Reels/Perfis do Instagram continuar navegável offline.
+DEMO_POSTS_SAMPLE = [
+    {
+        "inputUrl": "https://www.instagram.com/natgeo/",
+        "id": "3923124318436838545",
+        "type": "Image",
+        "shortCode": "DZxvMgyH8yR",
+        "caption": "[DEMO] Foto de exemplo de um post do Instagram, com legenda simulada.",
+        "hashtags": [],
+        "mentions": ["carstenpeter"],
+        "url": "https://www.instagram.com/p/DZxvMgyH8yR/",
+        "commentsCount": 110,
+        "likesCount": 55952,
+        "timestamp": "2026-06-20T10:00:04.000Z",
+        "ownerFullName": "National Geographic",
+        "ownerUsername": "natgeo",
+        "ownerId": "787132",
+        "isCommentsDisabled": False,
+        "isPinned": False,
+        "productType": "feed",
+    },
+    {
+        "inputUrl": "https://www.instagram.com/nasawebb/reels/",
+        "id": "3913028191006298064",
+        "type": "Video",
+        "shortCode": "DZN3mhZBQ_Q",
+        "caption": "[DEMO] Legenda simulada de um reel sobre um tema qualquer.",
+        "hashtags": [],
+        "mentions": [],
+        "url": "https://www.instagram.com/p/DZN3mhZBQ_Q/",
+        "commentsCount": 92,
+        "likesCount": 11481,
+        "timestamp": "2026-06-05T19:58:30.000Z",
+        "ownerFullName": "NASA Webb Telescope",
+        "ownerUsername": "nasawebb",
+        "ownerId": "549313808",
+        "isPinned": True,
+        "productType": "clips",
+        "videoDuration": 228,
+        "videoViewCount": 41365,
+        "videoPlayCount": 241820,
+        "isCommentsDisabled": False,
+    },
+]
+
+DEMO_PERFIL_SAMPLE = [
+    {
+        "inputUrl": "https://www.instagram.com/humansofny/",
+        "id": "242598499",
+        "username": "humansofny",
+        "url": "https://www.instagram.com/humansofny",
+        "fullName": "Humans of New York",
+        "biography": "[DEMO] Biografia simulada de um perfil qualquer.",
+        "externalUrl": "https://bit.ly/exemplo",
+        "followersCount": 12613771,
+        "followsCount": 738,
+        "isBusinessAccount": False,
+        "businessCategoryName": None,
+        "private": False,
+        "verified": True,
+        "postsCount": 5863,
+    }
 ]
 
 # ----------------------------------------------------------------------
@@ -110,6 +197,7 @@ DEFAULTS = {
     "bq_table_post_comments": "post_comments",
     "bq_table_gastos": "gastos",
     "bq_table_usuarios": "usuarios_permitidos",
+    "bq_table_posts_ig": "posts_instagram",
     "bq_credentials_json": None,
     "current_stage": 0,
     "log": [],
@@ -121,7 +209,13 @@ DEFAULTS = {
     "usuarios_permitidos": None,
     "prompt_sentimento": DEFAULT_PROMPT_SENTIMENTO,
     "prompt_relatorio": DEFAULT_PROMPT_RELATORIO,
+    "prompt_saudabilidade": DEFAULT_PROMPT_SAUDABILIDADE,
     "prompts_loaded": False,
+    "buscar_metricas_posts": True,
+    "ig_posts_links_input": "",
+    "ig_posts_results_type": "posts",
+    "ig_posts_limit": 12,
+    "ig_posts_df": None,
 }
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
@@ -147,6 +241,9 @@ if "secrets_loaded" not in st.session_state:
     st.session_state.bq_table_gastos = get_secret("BQ_TABLE_GASTOS", st.session_state.bq_table_gastos)
     st.session_state.bq_table_usuarios = get_secret(
         "BQ_TABLE_USUARIOS", st.session_state.bq_table_usuarios
+    )
+    st.session_state.bq_table_posts_ig = get_secret(
+        "BQ_TABLE_POSTS_IG", st.session_state.bq_table_posts_ig
     )
     bq_service_account = get_secret("BQ_SERVICE_ACCOUNT", None)
     if bq_service_account:
@@ -257,6 +354,204 @@ def classificar_demo(texto: str) -> str:
 
 
 # ----------------------------------------------------------------------
+# SAUDABILIDADE POR POST (agrega sentimento + métricas, 1 chamada Gemini por post)
+# ----------------------------------------------------------------------
+def montar_prompt_saudabilidade(resumo_sentimento: str, metricas_texto: str) -> str:
+    return (
+        st.session_state.prompt_saudabilidade.replace(
+            "{{MARCA}}", st.session_state.marca or "Não informado"
+        )
+        .replace("{{CAMPANHA}}", st.session_state.campanha or "Não informado")
+        .replace("{{DIRETRIZES}}", st.session_state.diretrizes_marca or "Nenhuma diretriz específica")
+        .replace("{{RESUMO_SENTIMENTO}}", resumo_sentimento)
+        .replace("{{METRICAS_POST}}", metricas_texto)
+    )
+
+
+def classificar_saudabilidade_demo(pos_pct: float, neg_pct: float) -> dict:
+    score = int(max(0, min(100, round(50 + (pos_pct - neg_pct) * 50))))
+    if score >= 70:
+        label = "Saudável"
+    elif score >= 40:
+        label = "Atenção"
+    else:
+        label = "Crítico"
+    return {
+        "saudabilidade_score": score,
+        "classificacao": label,
+        "resumo": f"[DEMO] Estimativa simples: {pos_pct:.0%} positivo vs {neg_pct:.0%} negativo nos comentários.",
+    }
+
+
+def gerar_saudabilidade_post(pos_pct: float, neu_pct: float, neg_pct: float, metricas_texto: str, total_comentarios: int) -> dict:
+    """Calcula a saudabilidade (0-100 + classificação) de um post, via Gemini quando
+    configurado, com fallback para uma estimativa simples baseada no sentimento."""
+    resumo_sentimento = (
+        f"Positivo: {pos_pct:.0%}, Neutro: {neu_pct:.0%}, Negativo: {neg_pct:.0%} "
+        f"(de {total_comentarios} comentários analisados)"
+    )
+    if is_gemini_configured():
+        try:
+            import google.generativeai as genai
+
+            genai.configure(api_key=st.session_state.gemini_key)
+            model = genai.GenerativeModel(st.session_state.gemini_model)
+            prompt = montar_prompt_saudabilidade(resumo_sentimento, metricas_texto)
+            resp = model.generate_content(prompt)
+            parsed = json.loads(resp.text.strip().strip("```json").strip("```"))
+            return {
+                "saudabilidade_score": parsed.get("saudabilidade_score"),
+                "saudabilidade_classificacao": parsed.get("classificacao"),
+                "saudabilidade_resumo": parsed.get("resumo"),
+            }
+        except Exception as e:
+            log(f"Aviso: não foi possível calcular saudabilidade via Gemini ({e}). Usando estimativa simples.")
+
+    demo = classificar_saudabilidade_demo(pos_pct, neg_pct)
+    return {
+        "saudabilidade_score": demo["saudabilidade_score"],
+        "saudabilidade_classificacao": demo["classificacao"],
+        "saudabilidade_resumo": demo["resumo"],
+    }
+
+
+def montar_resumo_por_post(resultados: pd.DataFrame) -> pd.DataFrame:
+    """Agrega a tabela de comentários (post_comments) em uma linha por post, juntando
+    contagem/percentual de sentimento com as métricas do post e a saudabilidade —
+    pensado para virar a aba 'resumo_por_post' no Excel de exportação."""
+    grupo = resultados.groupby("post_link", as_index=False).agg(
+        comentarios_analisados=("comentario", "count"),
+        positivos=("sentimento", lambda s: int((s == "Positivo").sum())),
+        neutros=("sentimento", lambda s: int((s == "Neutro").sum())),
+        negativos=("sentimento", lambda s: int((s == "Negativo").sum())),
+    )
+
+    campos_extra = [
+        "plataforma", "origem", "campanha", "marca", "mother_brand", "nucleo",
+        "likes_post", "comentarios_post", "views_post", "plays_post",
+        "compartilhamentos_post", "tipo_midia", "is_reel", "duracao_video_seg",
+        "data_publicacao_post", "saudabilidade_score", "saudabilidade_classificacao",
+        "saudabilidade_resumo",
+    ]
+    extras_presentes = [c for c in campos_extra if c in resultados.columns]
+    if extras_presentes:
+        extras = resultados.groupby("post_link", as_index=False)[extras_presentes].first()
+        grupo = grupo.merge(extras, on="post_link", how="left")
+
+    total = grupo["comentarios_analisados"].replace(0, pd.NA)
+    grupo["pct_positivo"] = (grupo["positivos"] / total).round(3)
+    grupo["pct_negativo"] = (grupo["negativos"] / total).round(3)
+    return grupo
+
+
+# ----------------------------------------------------------------------
+# POSTS / REELS / PERFIS DO INSTAGRAM (métricas: curtidas, comentários, views...)
+# ----------------------------------------------------------------------
+def coletar_posts_ig(links: list, results_type: str = "posts", limit: int = 12, only_newer_than=None):
+    """Chama o Actor de Posts/Reels/Perfis do Instagram no Apify.
+
+    results_type:
+      - "posts"   -> retorna os posts/reels de um perfil, ou o post/reel específico
+                     se o link já for de um post/reel.
+      - "details" -> retorna os dados do perfil (seguidores, bio, contagens, etc.).
+    """
+    from apify_client import ApifyClient
+
+    client = ApifyClient(st.session_state.apify_token)
+    run_input = {
+        "resultsType": results_type,
+        "directUrls": links,
+        "resultsLimit": limit,
+        "onlyPostsNewerThan": only_newer_than,
+        "search": None,
+        "searchType": "hashtag",
+        "searchLimit": 10,
+        "addParentData": False,
+    }
+    run = client.actor(ACTOR_INSTAGRAM_POSTS).call(run_input=run_input)
+    return list(client.dataset(run["defaultDatasetId"]).iterate_items())
+
+
+def normalizar_item_post(item: dict) -> dict:
+    """Achata um post/reel do Instagram em uma linha de métricas."""
+    return {
+        "link": item.get("url") or item.get("inputUrl", ""),
+        "input_url": item.get("inputUrl", ""),
+        "shortcode": item.get("shortCode", ""),
+        "tipo_midia": item.get("type", ""),
+        "is_reel": item.get("productType") == "clips",
+        "owner_username": item.get("ownerUsername", ""),
+        "owner_full_name": item.get("ownerFullName", ""),
+        "caption": (item.get("caption") or "")[:300],
+        "hashtags": ", ".join(item.get("hashtags") or []),
+        "mentions": ", ".join(item.get("mentions") or []),
+        "likes_post": item.get("likesCount"),
+        "comentarios_post": item.get("commentsCount"),
+        "views_post": item.get("videoViewCount"),
+        "plays_post": item.get("videoPlayCount"),
+        # O Instagram não expõe compartilhamentos via scraping — o Actor atual não
+        # retorna esse número. Deixamos o campo pronto (fica vazio) para o dia em
+        # que um Actor passar a trazer esse dado.
+        "compartilhamentos_post": item.get("shareCount") or item.get("reshareCount"),
+        "duracao_video_seg": item.get("videoDuration"),
+        "data_publicacao_post": item.get("timestamp"),
+        "pinado": item.get("isPinned"),
+        "comentarios_desabilitados": item.get("isCommentsDisabled"),
+        "data_extracao_metricas": datetime.now().isoformat(),
+    }
+
+
+def normalizar_item_perfil(item: dict) -> dict:
+    """Achata um perfil do Instagram (resultsType='details') em uma linha."""
+    return {
+        "link": item.get("url") or item.get("inputUrl", ""),
+        "username": item.get("username", ""),
+        "nome_completo": item.get("fullName", ""),
+        "biografia": item.get("biography", ""),
+        "seguidores": item.get("followersCount"),
+        "seguindo": item.get("followsCount"),
+        "qtd_posts": item.get("postsCount"),
+        "verificado": item.get("verified"),
+        "privado": item.get("private"),
+        "conta_business": item.get("isBusinessAccount"),
+        "categoria_negocio": item.get("businessCategoryName"),
+        "url_externa": item.get("externalUrl"),
+        "data_extracao": datetime.now().isoformat(),
+    }
+
+
+def buscar_metricas_posts_ig(links: list, limit_por_link: int = 1) -> dict:
+    """Busca métricas (curtidas, comentários, views) para uma lista de posts/reels
+    do Instagram e devolve um dicionário {link: métricas} para enriquecer os
+    comentários já coletados. Usado pela aba 'Coletar e analisar'."""
+    links = [l for l in links if l]
+    if not links:
+        return {}
+
+    if is_apify_configured():
+        try:
+            items = coletar_posts_ig(links, results_type="posts", limit=limit_por_link)
+            if items:
+                custo = registrar_gasto("instagram_posts", len(items))
+                log(f"Actor de posts/perfis IG retornou {len(items)} item(ns) — custo: ${custo:.4f}.")
+        except Exception as e:
+            log(f"Aviso: não foi possível buscar métricas dos posts do Instagram ({e}).")
+            return {}
+    else:
+        items = DEMO_POSTS_SAMPLE
+
+    metricas = {}
+    for item in items:
+        if "shortCode" not in item:
+            continue
+        linha = normalizar_item_post(item)
+        chave = linha["link"]
+        if chave:
+            metricas[chave] = linha
+    return metricas
+
+
+# ----------------------------------------------------------------------
 # GESTÃO DE USUÁRIOS PERMITIDOS
 # ----------------------------------------------------------------------
 def carregar_usuarios() -> list:
@@ -325,6 +620,9 @@ def carregar_prompts():
             st.session_state.prompt_relatorio = dados.get(
                 "prompt_relatorio", DEFAULT_PROMPT_RELATORIO
             )
+            st.session_state.prompt_saudabilidade = dados.get(
+                "prompt_saudabilidade", DEFAULT_PROMPT_SAUDABILIDADE
+            )
         except Exception:
             pass
 
@@ -337,6 +635,7 @@ def salvar_prompts():
                 {
                     "prompt_sentimento": st.session_state.prompt_sentimento,
                     "prompt_relatorio": st.session_state.prompt_relatorio,
+                    "prompt_saudabilidade": st.session_state.prompt_saudabilidade,
                 },
                 f,
                 indent=2,
@@ -441,6 +740,7 @@ st.write("")
 tab_labels = [
     "1️⃣ Links + contexto",
     "2️⃣ Coletar e analisar",
+    "📸 Posts & Perfis (IG)",
     "3️⃣ Sentimentalização",
     "4️⃣ Relatório aprofundado",
     "5️⃣ Salvar / Exportar",
@@ -536,6 +836,17 @@ with tabs["2️⃣ Coletar e analisar"]:
         for l in st.session_state.links_list:
             links_por_plataforma[detectar_plataforma(l)].append(l)
 
+        st.session_state.buscar_metricas_posts = st.checkbox(
+            "📊 Também buscar métricas dos posts do Instagram (curtidas, comentários, views)",
+            value=st.session_state.buscar_metricas_posts,
+            help=(
+                "Usa o Actor de Posts/Perfis do Instagram para complementar cada post com "
+                "números — é uma chamada de Apify separada da coleta de comentários, então "
+                "soma custo/tempo extra. Disponível só para links do Instagram (o Instagram "
+                "não expõe compartilhamentos via scraping)."
+            ),
+        )
+
         c1, c2, c3 = st.columns(3)
         c1.metric("Links Instagram", len(links_por_plataforma["instagram"]))
         c2.metric("Links TikTok", len(links_por_plataforma["tiktok"]))
@@ -543,6 +854,11 @@ with tabs["2️⃣ Coletar e analisar"]:
             (len(links_por_plataforma["instagram"]) * st.session_state.ig_limit / 1000) * RATE_PER_1000["instagram"]
             + (len(links_por_plataforma["tiktok"]) * st.session_state.tk_limit / 1000) * RATE_PER_1000["tiktok"]
         )
+        if st.session_state.buscar_metricas_posts:
+            # 1 chamada ao Actor de posts por link do Instagram (resultsLimit=1 cada)
+            custo_estimado += (
+                len(links_por_plataforma["instagram"]) / 1000
+            ) * RATE_PER_1000["instagram_posts"]
         c3.metric("Custo máx. estimado", f"${custo_estimado:.2f}")
 
         if not is_apify_configured():
@@ -642,6 +958,15 @@ with tabs["2️⃣ Coletar e analisar"]:
                 st.session_state.current_stage = max(st.session_state.current_stage, 1)
                 log(f"Coleta finalizada: {len(df)} comentários. Custo: ${custo_total_execucao:.2f}.")
 
+                metricas_posts_ig = {}
+                if st.session_state.buscar_metricas_posts and links_por_plataforma["instagram"]:
+                    with st.spinner("Buscando métricas dos posts do Instagram (curtidas, comentários, views)..."):
+                        metricas_posts_ig = buscar_metricas_posts_ig(links_por_plataforma["instagram"])
+                        if metricas_posts_ig:
+                            log(f"Métricas obtidas para {len(metricas_posts_ig)} post(s)/reel(s) do Instagram.")
+                        else:
+                            log("Aviso: nenhuma métrica de post do Instagram foi retornada.")
+
                 with st.spinner("Rodando sentimentalização automática no Gemini..."):
                     resultados = df.copy()
                     if is_gemini_configured():
@@ -681,6 +1006,50 @@ with tabs["2️⃣ Coletar e analisar"]:
                     resultados["mother_brand"] = st.session_state.mother_brand
                     resultados["nucleo"] = st.session_state.nucleo
 
+                    # Enriquecimento com métricas do post (curtidas, comentários, views...)
+                    if metricas_posts_ig:
+                        campos_extra = [
+                            "likes_post", "comentarios_post", "views_post", "plays_post",
+                            "compartilhamentos_post", "tipo_midia", "is_reel",
+                            "duracao_video_seg", "data_publicacao_post",
+                        ]
+                        for campo in campos_extra:
+                            resultados[campo] = resultados["post_link"].map(
+                                lambda l: metricas_posts_ig.get(l, {}).get(campo)
+                            )
+
+                with st.spinner("Calculando saudabilidade de cada post..."):
+                    saudabilidade_map = {}
+                    for post_link, grupo_post in resultados.groupby("post_link"):
+                        total_post = len(grupo_post)
+                        pos_pct = (grupo_post["sentimento"] == "Positivo").mean()
+                        neg_pct = (grupo_post["sentimento"] == "Negativo").mean()
+                        neu_pct = 1 - pos_pct - neg_pct
+
+                        partes_metricas = []
+                        if "likes_post" in grupo_post.columns:
+                            m = grupo_post.iloc[0]
+                            for campo, rotulo in [
+                                ("likes_post", "curtidas"),
+                                ("comentarios_post", "comentários no post"),
+                                ("views_post", "views"),
+                                ("plays_post", "plays"),
+                            ]:
+                                valor = m.get(campo)
+                                if pd.notna(valor):
+                                    partes_metricas.append(f"{rotulo}: {int(valor)}")
+                        metricas_texto = ", ".join(partes_metricas) if partes_metricas else "Não disponível"
+
+                        saudabilidade_map[post_link] = gerar_saudabilidade_post(
+                            pos_pct, neu_pct, neg_pct, metricas_texto, total_post
+                        )
+
+                    for campo in ("saudabilidade_score", "saudabilidade_classificacao", "saudabilidade_resumo"):
+                        resultados[campo] = resultados["post_link"].map(
+                            lambda l: saudabilidade_map.get(l, {}).get(campo)
+                        )
+                    log(f"Saudabilidade calculada para {len(saudabilidade_map)} post(s).")
+
                     st.session_state.resultados_df = resultados
                     st.session_state.current_stage = max(st.session_state.current_stage, 3)
 
@@ -693,6 +1062,161 @@ with tabs["2️⃣ Coletar e analisar"]:
         st.dataframe(st.session_state.resultados_df, use_container_width=True)
     elif st.session_state.comentarios_df is not None:
         st.dataframe(st.session_state.comentarios_df, use_container_width=True)
+
+# ----------------------------------------------------------------------
+# 📸 POSTS & PERFIS (INSTAGRAM) — métricas: curtidas, comentários, views...
+# ----------------------------------------------------------------------
+with tabs["📸 Posts & Perfis (IG)"]:
+    st.subheader("Posts, Reels e Perfis do Instagram (com métricas)")
+    st.caption(
+        "Cole links de **perfil** (ex.: `instagram.com/usuario/`) para trazer os últimos "
+        "posts/reels dele, ou links de **post/reel específico** para pegar só aquele "
+        "conteúdo — com curtidas, comentários e views. Também dá pra puxar só os "
+        "**dados do perfil** (seguidores, bio, verificado, etc.). "
+        "⚠️ O Instagram não expõe número de compartilhamentos via scraping, então esse "
+        "campo não está disponível aqui."
+    )
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.session_state.ig_posts_links_input = st.text_area(
+            "Links do Instagram — perfis e/ou posts/reels, um por linha",
+            value=st.session_state.ig_posts_links_input,
+            height=130,
+            placeholder=(
+                "https://www.instagram.com/humansofny/\n"
+                "https://www.instagram.com/p/DZxvMgyH8yR/\n"
+                "https://www.instagram.com/nasawebb/reels/"
+            ),
+            key="ig_posts_links_area",
+        )
+    with c2:
+        tipo_busca_label = st.selectbox(
+            "O que buscar",
+            ["Posts + Reels", "Dados do perfil (seguidores, bio...)"],
+            key="ig_posts_tipo_busca",
+        )
+        st.session_state.ig_posts_results_type = (
+            "posts" if tipo_busca_label.startswith("Posts") else "details"
+        )
+        if st.session_state.ig_posts_results_type == "posts":
+            st.session_state.ig_posts_limit = st.number_input(
+                "Máx. de posts/reels por link",
+                min_value=1,
+                max_value=200,
+                value=st.session_state.ig_posts_limit,
+            )
+
+    links_preview = [l.strip() for l in st.session_state.ig_posts_links_input.splitlines() if l.strip()]
+    if links_preview and st.session_state.ig_posts_results_type == "posts":
+        custo_estimado_posts = (
+            (len(links_preview) * st.session_state.ig_posts_limit / 1000) * RATE_PER_1000["instagram_posts"]
+        )
+        st.caption(
+            f"💸 Custo máx. estimado desta busca: **${custo_estimado_posts:.2f}** "
+            f"(${RATE_PER_1000['instagram_posts']:.2f} por mil itens do Actor de posts/perfis)."
+        )
+
+    if not is_apify_configured():
+        st.warning("Apify não configurado — vai mostrar dados de demonstração.")
+
+    if st.button("🚀 Buscar no Instagram", type="primary", key="btn_buscar_posts_ig"):
+        links_posts = [l.strip() for l in st.session_state.ig_posts_links_input.splitlines() if l.strip()]
+        if not links_posts:
+            st.warning("Cole ao menos um link.")
+        else:
+            with st.spinner("Buscando no Instagram..."):
+                items = []
+                if is_apify_configured():
+                    try:
+                        items = coletar_posts_ig(
+                            links_posts,
+                            results_type=st.session_state.ig_posts_results_type,
+                            limit=st.session_state.ig_posts_limit,
+                        )
+                        if items:
+                            custo_real = registrar_gasto("instagram_posts", len(items))
+                            log(
+                                f"Apify (posts/perfis IG) retornou {len(items)} registro(s) — "
+                                f"custo: ${custo_real:.4f}."
+                            )
+                        else:
+                            log("Apify (posts/perfis IG) não retornou registros.")
+                    except Exception as e:
+                        st.error(f"Erro ao chamar Apify: {e}")
+                else:
+                    time.sleep(0.5)
+                    items = (
+                        DEMO_POSTS_SAMPLE
+                        if st.session_state.ig_posts_results_type == "posts"
+                        else DEMO_PERFIL_SAMPLE
+                    )
+                    log("[DEMO] Dados fictícios de posts/perfil do Instagram gerados.")
+
+                if not items:
+                    st.warning("Nada retornado para esses links.")
+                else:
+                    if st.session_state.ig_posts_results_type == "posts":
+                        linhas = [normalizar_item_post(i) for i in items if "shortCode" in i]
+                    else:
+                        linhas = [normalizar_item_perfil(i) for i in items]
+                    st.session_state.ig_posts_df = pd.DataFrame(linhas)
+                    st.success(f"{len(linhas)} registro(s) encontrado(s).")
+
+    df_posts = st.session_state.ig_posts_df
+    if df_posts is not None and not df_posts.empty:
+        if "likes_post" in df_posts.columns:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Posts/Reels", len(df_posts))
+            c2.metric("Curtidas (total)", int(df_posts["likes_post"].fillna(0).sum()))
+            c3.metric("Comentários (total)", int(df_posts["comentarios_post"].fillna(0).sum()))
+            c4.metric("Views (total)", int(df_posts["views_post"].fillna(0).sum()))
+
+            fig_metricas = px.bar(
+                df_posts.sort_values("likes_post", ascending=False).head(20),
+                x="shortcode",
+                y=["likes_post", "comentarios_post"],
+                title="Curtidas x Comentários por post/reel (top 20)",
+                barmode="group",
+            )
+            fig_metricas.update_xaxes(tickangle=45)
+            st.plotly_chart(fig_metricas, use_container_width=True)
+        elif "seguidores" in df_posts.columns:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Perfis coletados", len(df_posts))
+            c2.metric("Seguidores (soma)", int(df_posts["seguidores"].fillna(0).sum()))
+            c3.metric("Posts publicados (soma)", int(df_posts["qtd_posts"].fillna(0).sum()))
+
+        st.dataframe(df_posts, use_container_width=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "⬇️ Baixar CSV",
+                data=df_posts.to_csv(index=False).encode("utf-8"),
+                file_name="posts_perfis_instagram.csv",
+                mime="text/csv",
+            )
+        with c2:
+            buffer_posts = io.BytesIO()
+            with pd.ExcelWriter(buffer_posts, engine="openpyxl") as writer:
+                df_posts.to_excel(writer, sheet_name="posts_perfis_ig", index=False)
+            st.download_button(
+                "⬇️ Baixar Excel",
+                data=buffer_posts.getvalue(),
+                file_name="posts_perfis_instagram.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        if not is_bq_configured():
+            st.caption("🟡 BigQuery não configurado — use os downloads acima por enquanto.")
+        elif st.button("💾 Salvar no BigQuery", key="btn_salvar_posts_bq"):
+            try:
+                table_id = salvar_df_bigquery(df_posts, st.session_state.bq_table_posts_ig)
+                st.success(f"Salvo em `{table_id}`.")
+                log(f"{len(df_posts)} linhas de posts/perfis IG salvas em {table_id}.")
+            except Exception as e:
+                st.error(f"Erro ao salvar no BigQuery: {e}")
 
 # ----------------------------------------------------------------------
 # 3) SENTIMENTALIZAÇÃO - VISÃO GERAL + EXEMPLOS NEUTROS
@@ -732,6 +1256,20 @@ with tabs["3️⃣ Sentimentalização"]:
             )
             fig_barras.update_xaxes(tickangle=45)
             st.plotly_chart(fig_barras, use_container_width=True)
+
+        st.markdown("##### 📊 Resumo por post (métricas + saudabilidade)")
+        resumo_post = montar_resumo_por_post(resultados)
+        if "saudabilidade_score" in resumo_post.columns and resumo_post["saudabilidade_score"].notna().any():
+            media_saude = resumo_post["saudabilidade_score"].astype(float).mean()
+            c1, c2 = st.columns(2)
+            c1.metric("Saudabilidade média (0-100)", f"{media_saude:.0f}")
+            c2.metric("Posts analisados", len(resumo_post))
+        st.dataframe(resumo_post, use_container_width=True)
+        st.caption(
+            "💡 'saudabilidade_score' e 'classificação' são gerados pelo Gemini a partir da "
+            "distribuição de sentimento + métricas do post. 'compartilhamentos_post' fica "
+            "vazio porque nenhum dos Actors atuais retorna esse dado do Instagram/TikTok."
+        )
 
         st.markdown("##### Filtrar / consultar comentários")
         filtro = st.multiselect(
@@ -840,9 +1378,12 @@ with tabs["5️⃣ Salvar / Exportar"]:
         st.info("Rode a coleta + análise primeiro.")
     else:
         st.caption(
-            "Tabela única (mesma estrutura pensada para o BigQuery no futuro) com "
-            "comentários + sentimento + origem (SIC/BR) + campanha + marca + núcleo."
+            "Exportação completa: comentários + sentimento + justificativa + saudabilidade "
+            "do post (Gemini) + métricas (curtidas, comentários do post, views, plays e "
+            "compartilhamentos — este último fica vazio, pois nenhum Actor atual retorna "
+            "esse dado) + origem (SIC/BR) + campanha + marca + núcleo."
         )
+        resumo_post_export = montar_resumo_por_post(resultados)
         st.dataframe(resultados, use_container_width=True)
 
         c1, c2 = st.columns(2)
@@ -850,11 +1391,17 @@ with tabs["5️⃣ Salvar / Exportar"]:
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                 resultados.to_excel(writer, sheet_name="post_comments", index=False)
+                resumo_post_export.to_excel(writer, sheet_name="resumo_por_post", index=False)
             st.download_button(
-                "⬇️ Baixar Excel único (post_comments)",
+                "⬇️ Baixar Excel completo (comentários + resumo por post)",
                 data=buffer.getvalue(),
-                file_name="post_comments.xlsx",
+                file_name="post_comments_completo.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+            st.caption(
+                "Aba 'post_comments' = 1 linha por comentário (com métricas e saudabilidade "
+                "repetidas). Aba 'resumo_por_post' = 1 linha por post, já agregado."
             )
         with c2:
             buffer_nucleo = io.BytesIO()
@@ -896,8 +1443,9 @@ with tabs["5️⃣ Salvar / Exportar"]:
 with tabs["💰 Gastos"]:
     st.subheader("Histórico de gastos com extração de comentários")
     st.caption(
-        f"Instagram: ${RATE_PER_1000['instagram']:.2f} por mil comentários · "
-        f"TikTok: ${RATE_PER_1000['tiktok']:.2f} por mil comentários."
+        f"Instagram (comentários): ${RATE_PER_1000['instagram']:.2f} por mil · "
+        f"TikTok (comentários): ${RATE_PER_1000['tiktok']:.2f} por mil · "
+        f"Instagram (posts/perfis): ${RATE_PER_1000['instagram_posts']:.2f} por mil itens."
     )
     if not st.session_state.gastos:
         st.caption("Nenhum gasto registrado ainda — rode uma coleta na aba 2.")
@@ -949,8 +1497,9 @@ if "⚙️ Configurações" in tabs:
                 "Apify API Token", value=st.session_state.apify_token, type="password"
             )
             st.caption(
-                f"Actors fixos: Instagram Comments Scraper (`{ACTOR_INSTAGRAM}`) "
-                f"e TikTok Comments Scraper (`{ACTOR_TIKTOK}`)."
+                f"Actors fixos: Instagram Comments Scraper (`{ACTOR_INSTAGRAM}`), "
+                f"TikTok Comments Scraper (`{ACTOR_TIKTOK}`) e Instagram Posts/Perfis "
+                f"(`{ACTOR_INSTAGRAM_POSTS}`)."
             )
             c1, c2 = st.columns(2)
             st.session_state.ig_limit = c1.number_input(
@@ -989,6 +1538,9 @@ if "⚙️ Configurações" in tabs:
             st.session_state.bq_table_gastos = st.text_input("Tabela de gastos", value=st.session_state.bq_table_gastos)
             st.session_state.bq_table_usuarios = st.text_input(
                 "Tabela de usuários permitidos", value=st.session_state.bq_table_usuarios
+            )
+            st.session_state.bq_table_posts_ig = st.text_input(
+                "Tabela de posts/perfis do Instagram", value=st.session_state.bq_table_posts_ig
             )
             cred_file = st.file_uploader("Service Account (JSON)", type=["json"], key="bq_upload")
             if cred_file is not None:
@@ -1039,6 +1591,26 @@ if "⚙️ Configurações" in tabs:
                 st.success("Salvo.")
             if c2.button("↩️ Restaurar prompt padrão do relatório"):
                 st.session_state.prompt_relatorio = DEFAULT_PROMPT_RELATORIO
+                salvar_prompts()
+                st.rerun()
+
+            st.divider()
+            st.markdown("#### Prompt de saudabilidade do post")
+            st.caption(
+                "Roda 1x por post (não por comentário), a partir da distribuição de "
+                "sentimento já calculada. Placeholders: `{{MARCA}}`, `{{CAMPANHA}}`, "
+                "`{{DIRETRIZES}}`, `{{RESUMO_SENTIMENTO}}`, `{{METRICAS_POST}}`."
+            )
+            st.session_state.prompt_saudabilidade = st.text_area(
+                "Prompt de saudabilidade", value=st.session_state.prompt_saudabilidade, height=220
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("💾 Salvar prompt de saudabilidade"):
+                salvar_prompts()
+                log("Prompt de saudabilidade atualizado.")
+                st.success("Salvo.")
+            if c2.button("↩️ Restaurar prompt padrão de saudabilidade"):
+                st.session_state.prompt_saudabilidade = DEFAULT_PROMPT_SAUDABILIDADE
                 salvar_prompts()
                 st.rerun()
 
